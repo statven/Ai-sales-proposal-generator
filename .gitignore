@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+*.venv
+env/
+venv/
+ENV/
+.venv/
+
+# VSCode / JetBrains
+.vscode/
+.idea/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker
+*.pid
+*.tar
+*.bak
+*.swp
+docker-compose.override.yml
+
+# Streamlit
+.streamlit/
+.cache/
+__streamlit_cache__/
+
+# Generated or temporary files
+output/
+generated_docs/
+*.docx
