@@ -1,7 +1,7 @@
 
 ## Architecture Diagram
 
-![Component Diagram](docs/component_diagram.png)
+![Component Diagram](docs/component.png)
 
 **Main Components:**
 
@@ -16,7 +16,7 @@
 
 ## Sequence Diagram
 
-![Sequence Diagram](docs/sequence_diagram.png)
+![Sequence Diagram](docs/sequence.png)
 
 **Step-by-Step Flow:**
 
