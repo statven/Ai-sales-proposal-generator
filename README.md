@@ -1,28 +1,27 @@
 
 ## Architecture Diagram
 
-![Component Diagram](docs/component.png)
+![Component Diagram](docs/component_diagram.png)
 
-**Основные компоненты:**
+**Main Components:**
 
-- **User (Пользователь)** – заполняет форму и нажимает «Generate».
-- **Streamlit (Frontend)** – веб-приложение, отправляет запрос к backend и получает файл.
-- **FastAPI (Backend / API)** – принимает POST-запросы, валидирует данные, координирует AI Core и Document Engine, возвращает DOCX.
-- **AI Core** – формирует промпт, отправляет в OpenAI, получает текст.
-- **OpenAI API** – облачный сервис, возвращает сгенерированный текст.
-- **Document Engine (python-docx)** – вставляет текст в template.docx, формирует финальный DOCX.
-- **template.docx** – DOCX-шаблон с стилями, placeholders и логотипом.
-
+- **User** – fills out the form in the browser and clicks “Generate”.
+- **Streamlit (Frontend)** – simple web app; sends requests to backend and receives the file. It’s the only entry point from the user’s perspective.
+- **FastAPI (Backend / API)** – receives POST requests, validates input (Pydantic), coordinates AI Core and Document Engine, returns the final DOCX file.
+- **AI Core** – generates prompts based on form data and selected options (tone, audience, structure), sends request to OpenAI, receives structured text (Markdown or similar).
+- **OpenAI API** – cloud service that returns generated text.
+- **Document Engine (python-docx)** – parses Markdown text, applies styles, inserts into `template.docx`, produces the final DOCX file in memory (BytesIO).
+- **template.docx** – DOCX template with pre-defined styles (Heading 1/2), logo in headers, placeholders (e.g., `{{title}}`, `{{sections}}`).
 
 
 ## Sequence Diagram
 
-![Sequence Diagram](docs/sequence.png)
+![Sequence Diagram](docs/sequence_diagram.png)
 
-**Step-by-step flow:**
+**Step-by-Step Flow:**
 
-1. **User → Streamlit:** заполняет поля (название компании, контакт, требования, тон) и нажимает «Generate».
-2. **Streamlit → FastAPI (POST /generate, JSON body):**  
+1. **User → Streamlit:** fills in fields (company name, contact, requirements, tone) and clicks “Generate”.
+2. **Streamlit → FastAPI (POST /generate, JSON body):**
 ```json
 {
   "client_name": "Example Corp",
@@ -34,10 +33,10 @@
 }
 ````
 
-3. **FastAPI → AI Core:** формирует промпт и отправляет в OpenAI.
-4. **AI Core → OpenAI API:** получает сгенерированный текст.
-5. **FastAPI → Document Engine:** парсит текст и формирует DOCX.
-6. **Document Engine → FastAPI:** возвращает готовый файл.
-7. **FastAPI → Streamlit:** отдаёт DOCX пользователю для скачивания.
+3. **FastAPI → AI Core:** constructs the prompt and sends it to OpenAI.
+4. **AI Core → OpenAI API:** receives generated text.
+5. **FastAPI → Document Engine:** parses text and generates DOCX.
+6. **Document Engine → FastAPI:** returns the completed file.
+7. **FastAPI → Streamlit:** sends the final DOCX back to the user for download.
 
-```
+
