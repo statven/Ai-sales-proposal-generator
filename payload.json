@@ -1,0 +1,36 @@
+{
+  "client_name": "ООО Инновационные Решения",
+  "provider_name": "Digital Forge Group",
+  "project_goal": "Автоматизация генерации коммерческих предложений",
+  "scope": "Полная интеграция CRM и миграция e-commerce платформы",
+  "technologies": ["Python", "FastAPI", "docxtpl"],
+  "deadline": "2025-10-31",
+  "tone": "Formal",
+  "deliverables": [
+    {
+      "title": "Custom CRM Integration",
+      "description": "Интеграция нового модуля CRM с текущей системой учета клиентов.",
+      "acceptance_criteria": "100% юнит-тестов пройдено, успешный перенос 99% данных."
+    },
+    {
+      "title": "E-commerce Migration",
+      "description": "Миграция платформы онлайн-продаж с Magento на Shopify Plus.",
+      "acceptance_criteria": "Время простоя < 3 часов; 100% функциональность оформления заказа."
+    }
+  ],
+  "phases": [
+    {
+      "duration_weeks": 4,
+      "tasks": "- Сбор требований\n- Разработка ТЗ\n- Согласование UAT"
+    },
+    {
+      "duration_weeks": 10,
+      "tasks": "- Разработка бэкенда\n- Фронтенд интеграция\n- Промежуточное тестирование"
+    }
+  ],
+  "financials": {
+    "development_cost": 45000,
+    "licenses_cost": 5000,
+    "support_cost": 2500
+  }
+}
