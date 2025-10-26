@@ -1,0 +1,165 @@
+
+# --- Python build & cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+*.env
+*.venv
+
+# --- Python environment files ---
+Pipfile
+Pipfile.lock
+poetry.lock
+
+# --- OS-specific files ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- IDE / Editor configs ---
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.iml
+
+# --- Logs & reports ---
+*.log
+logs/
+*.out
+*.err
+
+# --- Temporary / generated files ---
+tmp/
+temp/
+cache/
+.cache/
+__streamlit_cache__/
+output/
+generated_docs/
+uploads/
+reports/
+__pycache__/
+*.bak
+*.swp
+*.pid
+*.tar
+
+# --- Streamlit specific ---
+.streamlit/
+# Allow Streamlit config example
+!.streamlit/config.toml.example
+
+# --- Project-specific output ---
+output_proposal.docx
+payload.json
+response_body.txt
+test_openai.py
+test_*.py
+tests/__pycache__/
+tests/tmp/
+*.docx
+
+# --- DOCX / Generated documents ---
+*.docx
+*.pdf
+*.xlsx
+*.pptx
+
+# --- Docker related ---
+docker-compose.override.yml
+*.pid
+*.tar
+
+# --- Node / Frontend related (if Streamlit or React frontend exists) ---
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+frontend/.cache/
+frontend/.next/
+frontend/yarn-error.log
+frontend/package-lock.json
+frontend/npm-debug.log
+
+# --- Backend compiled / runtime artifacts ---
+backend/__pycache__/
+backend/*.pyc
+backend/app/__pycache__/
+backend/app/logs/
+backend/tmp/
+backend/output/
+
+# --- Environment & Secrets ---
+.env
+.env.local
+.env.*.local
+.env.example          # Allowed if contains placeholders only
+!backend/.env.example # Allow safe example if it's sanitized
+
+# --- Database / Local data ---
+*.db
+*.sqlite3
+*.sqlite
+db.sqlite*
+database/
+migrations/
+
+# --- Jupyter / Research ---
+*.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+*.ipynb
+
+# --- Mac & Windows metadata ---
+ehthumbs.db
+Icon?
+$RECYCLE.BIN/
+*.lnk
+
+# --- VSCode specific backup files ---
+*.code-workspace
+.vscode/settings.json
+.vscode/tasks.json
+.vscode/launch.json
+
+# --- Miscellaneous ---
+*.orig
+*.rej
+*.tmp
+*.bak
+*.swp
+*.swo
+~*
+
+# --- Git backup / patch / rebase data ---
+*.patch
+*.diff
+*.merge_file
+*.orig
+*.rej
+
+# --- Coverage / Testing ---
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.pytest_cache/
+pytestdebug.log
+
+# --- Compiled translations ---
+*.mo
+*.pot
+
+# --- Build directories ---
+build/
+dist/
+*.egg-info/
+.eggs/
+
+
