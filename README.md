@@ -90,7 +90,7 @@ Open API docs (Swagger UI): `http://127.0.0.1:8000/docs#/default/generate_propos
 
 ## Quick start (local)
 
-> These steps produce a local development environment. Replace placeholders with your own values. **Do not** put secrets in the Git repo.
+> These steps produce a local development environment. Replace placeholders with your own values.
 
 1. Clone
 
