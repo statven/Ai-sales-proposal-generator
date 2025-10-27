@@ -126,19 +126,19 @@ cp .env.example .env
 PowerShell (temporary for session):
 
 ```powershell
-$env:OPENAI_API_KEY = "sk-REPLACE_WITH_YOUR_KEY"
+$env:HUGGINGFACE_API_KEY = "REPLACE_WITH_YOUR_KEY"
 ```
 
 PowerShell (persist via setx - requires reopening shell for the change to take effect):
 
 ```powershell
-setx OPENAI_API_KEY "sk-REPLACE_WITH_YOUR_KEY"
+setx HUGGINGFACE_API_KEY "REPLACE_WITH_YOUR_KEY"
 ```
 
 macOS / Linux:
 
 ```bash
-export OPENAI_API_KEY="sk-REPLACE_WITH_YOUR_KEY"
+export HUGGINGFACE_API_KEY="REPLACE_WITH_YOUR_KEY"
 ```
 
 ### Setting your OpenAI key 
