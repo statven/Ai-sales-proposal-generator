@@ -121,10 +121,28 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env to set OPENAI_API_KEY and any other variables
 ```
+### Setting your Hugging Face key 
 
-### Setting your OpenAI key (safe examples)
+PowerShell (temporary for session):
 
-**Do NOT** paste a real key into files you commit. Use local env or secrets manager.
+```powershell
+$env:OPENAI_API_KEY = "sk-REPLACE_WITH_YOUR_KEY"
+```
+
+PowerShell (persist via setx - requires reopening shell for the change to take effect):
+
+```powershell
+setx OPENAI_API_KEY "sk-REPLACE_WITH_YOUR_KEY"
+```
+
+macOS / Linux:
+
+```bash
+export OPENAI_API_KEY="sk-REPLACE_WITH_YOUR_KEY"
+```
+
+### Setting your OpenAI key 
+
 
 PowerShell (temporary for session):
 
@@ -169,7 +187,7 @@ uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
 If the main module is named differently (e.g., `app.py`) then use `uvicorn app:app --reload ...`. The swagger UI will be at `http://127.0.0.1:8000/docs`.
 
-### Frontend (Streamlit)
+### ~~Frontend (Streamlit)~~ In development 
 
 From project root:
 
