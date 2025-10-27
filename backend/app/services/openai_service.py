@@ -1,241 +1,90 @@
 # backend/app/services/openai_service.py
 """
-Robust OpenAI service wrapper (synchronous).
-- Reads config from environment.
-- Supports new OpenAI client or older openai.* interfaces.
-- Stub mode for local development/testing.
-- Exponential backoff + jitter retries.
-- Fallback to cheaper model on rate-limit.
-- Simple process-local LRU caching for identical prompts.
-- Returns a string (raw model text). Never raises OpenAI errors to callers.
+Minimal, safe migration to use openai.OpenAI() client when available.
+
+Behavior:
+- Try to use new `openai.OpenAI()` client only.
+- Do NOT attempt legacy calls that trigger APIRemovedInV1 (Completion.create / ChatCompletion.create).
+- If OpenAI client is missing/unusable, skip OpenAI and try Hugging Face fallback.
+- If both fail, return deterministic stub JSON.
+- Minimal changes to keep compatibility with ai_core/main (generate_ai_json returns str).
 """
 
-# backend/app/services/openai_service.py (top portion)
+from __future__ import annotations
+
 import os
 import time
 import random
+import json
 import logging
 import hashlib
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Tuple
 from functools import lru_cache, wraps
 
-logger = logging.getLogger(__name__)
+import requests
 
-# Try to import openai and its exception classes in a robust way.
-# If openai is not installed, we provide graceful fallbacks so the module
-# can still be imported (useful for running in stub mode or tests).
+# try import openai
 try:
     import openai
-    # Try to import exception classes used by the SDK
-    try:
-        from openai.error import OpenAIError, RateLimitError, PermissionError as OpenAIPermissionError
-    except Exception:
-        # older/newer SDKs might expose these differently; try to map common names
-        try:
-            OpenAIError = getattr(openai, "OpenAIError")
-        except Exception:
-            class OpenAIError(Exception): pass
-        try:
-            RateLimitError = getattr(openai, "RateLimitError")
-        except Exception:
-            class RateLimitError(OpenAIError): pass
-        try:
-            OpenAIPermissionError = getattr(openai, "PermissionError")
-        except Exception:
-            class OpenAIPermissionError(OpenAIError): pass
-    # try to import new-style client
-    try:
-        from openai import OpenAI as OpenAIClientClass  # type: ignore
-    except Exception:
-        OpenAIClientClass = None
-except ModuleNotFoundError:
-    openai = None  # type: ignore
-    OpenAIClientClass = None
-    class OpenAIError(Exception): pass
-    class RateLimitError(OpenAIError): pass
-    class OpenAIPermissionError(OpenAIError): pass
-    logger.warning("openai package not installed in this environment — OpenAI features disabled. Install with 'pip install openai' to enable.")
+except Exception:
+    openai = None
 
+logger = logging.getLogger("uvicorn.error")
 
-# --- Configuration ---
+# --- ENV / configuration ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_API_TYPE = os.getenv("OPENAI_API_TYPE", "").lower()  # "" or "azure"
-OPENAI_API_BASE = os.getenv("OPENAI_API_BASE")
-OPENAI_API_VERSION = os.getenv("OPENAI_API_VERSION")
-OPENAI_DEPLOYMENT = os.getenv("OPENAI_DEPLOYMENT")
-
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
-OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-3.5-turbo")
+OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", OPENAI_MODEL)
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "1024"))
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.3"))
 OPENAI_REQUEST_TIMEOUT = int(os.getenv("OPENAI_REQUEST_TIMEOUT", "30"))
-
 OPENAI_RETRY_ATTEMPTS = int(os.getenv("OPENAI_RETRY_ATTEMPTS", "3"))
 OPENAI_RETRY_BACKOFF_BASE = float(os.getenv("OPENAI_RETRY_BACKOFF_BASE", "1.0"))
 OPENAI_USE_STUB = os.getenv("OPENAI_USE_STUB", "0").lower() in ("1", "true", "yes")
 
-# initialize client where possible (work with both old/new libs)
-_client = None
-_USE_NEW_CLIENT = False
+# Hugging Face fallback
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+HUGGINGFACE_INFERENCE_URL = os.getenv("HUGGINGFACE_INFERENCE_URL")
+HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "")
 
-if OPENAI_API_KEY:
+# If module-level api_key attribute exists, set it for best-effort compatibility
+if openai is not None and OPENAI_API_KEY:
     try:
-        # set top-level openai.api_key for older clients
-        openai.api_key = OPENAI_API_KEY
+        if hasattr(openai, "api_key"):
+            openai.api_key = OPENAI_API_KEY
     except Exception:
-        logger.debug("Could not set openai.api_key (older/new client mismatch).")
+        # ignore if cannot set
+        pass
 
-# try to create new client instance if available
-if OpenAIClientClass is not None:
-    try:
-        if OPENAI_API_KEY:
-            _client = OpenAIClientClass(api_key=OPENAI_API_KEY)
-        else:
-            _client = OpenAIClientClass()
-        _USE_NEW_CLIENT = True
-        # configure azure-specific properties on global openai module if needed
-        if OPENAI_API_TYPE == "azure":
-            openai.api_type = "azure"
-            if OPENAI_API_BASE:
-                openai.api_base = OPENAI_API_BASE
-            if OPENAI_API_VERSION:
-                openai.api_version = OPENAI_API_VERSION
-    except Exception as e:
-        logger.warning("Could not initialize new OpenAI client: %s. Falling back to module-level API.", e)
-        _client = None
-        _USE_NEW_CLIENT = False
-
-# --- caching helper (process-local) ---
-def _hash_text(s: str) -> str:
+# --- utilities ---
+def _prompt_hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def lru_cache_func(maxsize: int = 256):
-    def deco(fn):
-        cached = lru_cache(maxsize=maxsize)(fn)
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            return cached(*args, **kwargs)
-        wrapper.cache_clear = cached.cache_clear
-        return wrapper
-    return deco
-
-# low-level call wrapper — try multiple invocation styles to maximize compatibility
-def _invoke_chat_completion(prompt: str, model: str) -> str:
-    """
-    Attempt to call OpenAI chat completion using whichever API surface is available.
-    May raise OpenAIError exceptions upstream; caller will handle retries.
-    Returns the raw string content (or empty string).
-    """
-    messages = [{"role": "user", "content": prompt}]
-
-    # 1) Try new client (OpenAI())
-    if _USE_NEW_CLIENT and _client is not None:
-        try:
-            # new client uses client.chat.completions.create
-            resp = _client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=OPENAI_MAX_TOKENS,
-                temperature=OPENAI_TEMPERATURE,
-                request_timeout=OPENAI_REQUEST_TIMEOUT
-            )
-            # try common ways to access content
-            choice = resp.choices[0]
-            # choice.message.content or choice["message"]["content"]
-            content = getattr(choice, "message", None)
-            if content:
-                # some client returns object with .get or .content
-                if isinstance(content, dict):
-                    return content.get("content", "") or ""
-                return getattr(content, "content", "") or ""
-            # fallback dictionary-style
-            try:
-                return resp.choices[0]["message"]["content"]
-            except Exception:
-                return ""
-        except Exception:
-            raise
-
-    # 2) Try module-level chat.completions.create (older)
-    try:
-        # some versions use openai.ChatCompletion.create, some openai.chat.completions.create
-        if hasattr(openai, "chat") and hasattr(openai.chat, "completions") and hasattr(openai.chat.completions, "create"):
-            resp = openai.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=OPENAI_MAX_TOKENS,
-                temperature=OPENAI_TEMPERATURE,
-                request_timeout=OPENAI_REQUEST_TIMEOUT
-            )
-        elif hasattr(openai, "ChatCompletion") and hasattr(openai.ChatCompletion, "create"):
-            resp = openai.ChatCompletion.create(
-                model=model,
-                messages=messages,
-                max_tokens=OPENAI_MAX_TOKENS,
-                temperature=OPENAI_TEMPERATURE,
-                request_timeout=OPENAI_REQUEST_TIMEOUT
-            )
-        else:
-            # try the generic create on openai (last resort)
-            resp = openai.Completion.create(
-                engine=model,
-                prompt=prompt,
-                max_tokens=OPENAI_MAX_TOKENS,
-                temperature=OPENAI_TEMPERATURE
-            )
-            # Completion returns text rather than chat schema
-            return getattr(resp, "choices", [])[0].text if getattr(resp, "choices", None) else ""
-        # Now extract text in a few ways
-        try:
-            # common shape: resp.choices[0].message.content
-            choice = resp.choices[0]
-            if hasattr(choice, "message"):
-                message = choice.message
-                if isinstance(message, dict):
-                    return message.get("content", "") or ""
-                return getattr(message, "content", "") or ""
-            # fallback dict-style
-            try:
-                return resp.choices[0]["message"]["content"]
-            except Exception:
-                # Last fallback: if model returned text directly
-                return getattr(choice, "text", "") or ""
-        except Exception:
-            return ""
-    except Exception:
-        # bubble up
-        raise
-
-# cached low-level call to avoid repeating identical prompts in same process
-@lru_cache_func(maxsize=512)
-def _call_model_cached(prompt: str, model: str) -> str:
-    return _invoke_chat_completion(prompt, model)
-
 def _build_prompt(proposal: Dict[str, Any], tone: str = "Formal") -> str:
-    # Minimal sanitization of provided inputs (we assume ai_core or caller sanitized them earlier)
-    client = str(proposal.get("client_name", "") or "")
-    provider = str(proposal.get("provider_name", "") or "")
-    goal = str(proposal.get("project_goal", "") or "")
-    scope = str(proposal.get("scope", "") or "")
+    client = proposal.get("client_name", "")
+    provider = proposal.get("provider_name", "")
+    project_goal = proposal.get("project_goal", "")
+    scope = proposal.get("scope", "")
     technologies = proposal.get("technologies") or []
-    techs = ", ".join(technologies) if isinstance(technologies, list) else str(technologies)
-    deadline = str(proposal.get("deadline", "") or "")
+    techs = ", ".join(technologies) if isinstance(technologies, (list, tuple)) else str(technologies)
+    deadline = proposal.get("deadline", "")
+
     tone_instruction = {
         "Formal": "Use a formal, professional tone focused on clarity and precision.",
         "Marketing": "Write in a persuasive, benefit-focused marketing tone (highlight outcomes).",
         "Technical": "Write in a detailed technical tone focusing on architecture and acceptance criteria.",
-        "Friendly": "Write in a friendly, conversational tone."
+        "Friendly": "Write in a friendly, conversational tone.",
     }.get(tone, "Use a neutral and professional tone.")
 
-    template = f"""
-You are a professional proposal writer. Output ONLY valid JSON (UTF-8) with EXACTLY these keys:
-executive_summary_text, project_mission_text, solution_concept_text, project_methodology_text,
-financial_justification_text, payment_terms_text, development_note, licenses_note, support_note.
+    prompt = f"""
+You are an expert commercial proposal writer. RETURN EXACTLY ONE VALID JSON OBJECT and NOTHING ELSE.
+The object must contain exactly these keys (strings): executive_summary_text, project_mission_text, solution_concept_text,
+project_methodology_text, financial_justification_text, payment_terms_text, development_note, licenses_note, support_note.
 
 Input:
 client_name: "{client}"
 provider_name: "{provider}"
-project_goal: "{goal}"
+project_goal: "{project_goal}"
 scope: "{scope}"
 technologies: "{techs}"
 deadline: "{deadline}"
@@ -244,102 +93,249 @@ tone: "{tone}"
 Instruction:
 {tone_instruction}
 
-Return a single JSON object and nothing else. If you cannot produce text for a field, return an empty string for that field.
+For each field: write 1-4 concise sentences. If you cannot determine a field, set it to an empty string "".
+Do NOT include extra keys.
+
+EXACT JSON EXAMPLE:
+{{
+  "executive_summary_text": "Short summary...",
+  "project_mission_text": "Mission ...",
+  "solution_concept_text": "Solution ...",
+  "project_methodology_text": "Methodology ...",
+  "financial_justification_text": "Why investment ...",
+  "payment_terms_text": "Payment schedule ...",
+  "development_note": "What development covers ...",
+  "licenses_note": "Licenses included ...",
+  "support_note": "Support and SLA ..."
+}}
 """
-    return template.strip()
+    return prompt.strip()
 
-def _fallback_stub(proposal: Dict[str, Any]) -> str:
-    """Return guaranteed-valid JSON (string) as fallback."""
-    import json
-    client = proposal.get("client_name") or "Client"
-    stub = {
-        "executive_summary_text": f"This is a fallback executive summary for {client}.",
-        "project_mission_text": "Project mission: deliver measurable value and reliable software.",
-        "solution_concept_text": "Proposed solution: pragmatic modular services and integrations.",
-        "project_methodology_text": "Agile approach with two-week sprints, CI/CD and demos.",
-        "financial_justification_text": "Investment is justified by expected revenue uplift and efficiency gains.",
-        "payment_terms_text": "50% upfront, 50% on delivery. Proposal valid for 30 days.",
-        "development_note": "Includes development, QA and DevOps efforts.",
-        "licenses_note": "Includes required third-party SaaS licenses and hosting.",
-        "support_note": "Includes 3 months of post-launch support."
-    }
-    return json.dumps(stub, ensure_ascii=False)
+def _extract_text_from_openai_response(resp: Any) -> str:
+    """
+    Robust extraction for likely response shapes from new OpenAI client.
+    """
+    try:
+        if hasattr(resp, "choices"):
+            choices = resp.choices
+            if choices and len(choices) > 0:
+                first = choices[0]
+                # try message.content
+                msg = getattr(first, "message", None)
+                if msg is not None:
+                    content = getattr(msg, "content", None)
+                    if content is None and isinstance(msg, dict):
+                        content = msg.get("content") or msg.get("text")
+                    if content:
+                        return content
+                # try .text
+                if hasattr(first, "text") and first.text:
+                    return first.text
+                # dict-like fallback
+                if isinstance(first, dict):
+                    m = first.get("message")
+                    if isinstance(m, dict):
+                        return m.get("content") or m.get("text") or ""
+                    return first.get("text") or ""
+        # dict-like response
+        if isinstance(resp, dict):
+            choices = resp.get("choices")
+            if isinstance(choices, list) and choices:
+                first = choices[0]
+                if isinstance(first, dict):
+                    m = first.get("message")
+                    if isinstance(m, dict):
+                        return m.get("content") or m.get("text") or ""
+                    return first.get("text") or ""
+    except Exception:
+        logger.debug("Failed to parse OpenAI response shape", exc_info=True)
+    try:
+        return str(resp) or ""
+    except Exception:
+        return ""
 
+# ------------- OpenAI: NEW client only -------------
+def _call_openai_new_client(prompt_str: str, model_name: str) -> str:
+    """
+    Use only new openai.OpenAI() client. If not available or fails, raise exception.
+    This intentionally avoids attempting legacy API paths that will raise APIRemovedInV1.
+    """
+    if openai is None:
+        raise RuntimeError("openai package not installed")
+
+    OpenAIClass = getattr(openai, "OpenAI", None)
+    if OpenAIClass is None:
+        # no new client available in this runtime: treat as not supported here
+        raise RuntimeError("openai.OpenAI client class not available in this installation")
+
+    # construct client (best-effort: accept api_key in constructor or default)
+    try:
+        try:
+            client = OpenAIClass(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else OpenAIClass()
+        except TypeError:
+            client = OpenAIClass()
+    except Exception as e:
+        raise RuntimeError(f"Failed to instantiate openai.OpenAI client: {e}")
+
+    # prepare messages
+    messages = [{"role": "user", "content": prompt_str}]
+
+    # prefer client.chat.completions.create (new client shape)
+    create_fn = None
+    try:
+        create_fn = getattr(getattr(client, "chat", None), "completions", None)
+        create_fn = getattr(create_fn, "create", None) if create_fn else None
+    except Exception:
+        create_fn = None
+
+    if not create_fn:
+        raise RuntimeError("openai.OpenAI client found but chat.completions.create() not available on it")
+
+    # call (try request_timeout first, fall back if TypeError)
+    try:
+        try:
+            resp = create_fn(model=model_name, messages=messages, max_tokens=OPENAI_MAX_TOKENS, temperature=OPENAI_TEMPERATURE, request_timeout=OPENAI_REQUEST_TIMEOUT)
+        except TypeError:
+            resp = create_fn(model=model_name, messages=messages, max_tokens=OPENAI_MAX_TOKENS, temperature=OPENAI_TEMPERATURE)
+        text = _extract_text_from_openai_response(resp)
+        logger.info("OpenAI new client returned result for model=%s", model_name)
+        return text or ""
+    except Exception as e:
+        logger.exception("OpenAI new client invocation failed: %s", e)
+        raise
+
+# ------------- caching wrapper -------------
+def _cached_call(maxsize: int = 256):
+    def deco(fn):
+        cached = lru_cache(maxsize=maxsize)(fn)
+        @wraps(fn)
+        def wrapper(prompt_str: str, model_name: str):
+            return cached(prompt_str, model_name)
+        wrapper.cache_clear = cached.cache_clear
+        return wrapper
+    return deco
+
+@_cached_call(maxsize=512)
+def _invoke_openai_cached(prompt_str: str, model_name: str) -> str:
+    # cached wrapper around new-client call
+    return _call_openai_new_client(prompt_str, model_name)
+
+# ------------- Hugging Face fallback -------------
+def _call_huggingface(prompt_str: str) -> Tuple[str, str]:
+    if not HUGGINGFACE_INFERENCE_URL:
+        return "", "HuggingFace not configured"
+    headers = {}
+    if HUGGINGFACE_API_KEY:
+        headers["Authorization"] = f"Bearer {HUGGINGFACE_API_KEY}"
+    payload = {"inputs": prompt_str, "options": {"wait_for_model": True}}
+    try:
+        r = requests.post(HUGGINGFACE_INFERENCE_URL, headers=headers, json=payload, timeout=30)
+    except Exception as e:
+        return "", f"HF request error: {e}"
+    if r.status_code != 200:
+        return "", f"hf-status-{r.status_code}:{r.text}"
+    try:
+        data = r.json()
+        if isinstance(data, dict) and "generated_text" in data:
+            return data["generated_text"], "huggingface_success"
+        if isinstance(data, list):
+            first = data[0]
+            if isinstance(first, dict) and "generated_text" in first:
+                return first["generated_text"], "huggingface_success"
+            if isinstance(first, str):
+                return first, "huggingface_success"
+        if isinstance(data, str):
+            return data, "huggingface_success"
+        return r.text, "huggingface_success"
+    except Exception as e:
+        return "", f"hf-parse-error:{e}"
+
+# ------------- public entrypoint -------------
 def generate_ai_json(proposal: Dict[str, Any], tone: str = "Formal") -> str:
     """
-    Synchronous entrypoint.
-    Returns: raw model text (expected JSON string). On all failures returns either stub JSON (if configured) or empty string.
+    Returns model text or JSON string. Tries:
+      1) cached new OpenAI client
+      2) live OpenAI new client (retries)
+      3) Hugging Face fallback
+      4) deterministic stub
+    Always returns a str (never None).
     """
-    # stub mode for offline/dev
     if OPENAI_USE_STUB:
-        logger.info("OPENAI_USE_STUB enabled — returning fallback stub JSON.")
-        return _fallback_stub(proposal)
+        client_name = proposal.get("client_name", "Client")
+        stub = {
+            "executive_summary_text": f"This is a fallback executive summary for {client_name}.",
+            "project_mission_text": "Deliver a reliable, maintainable solution that provides measurable business value.",
+            "solution_concept_text": "We propose a pragmatic architecture using modular services and reliable third-party platforms.",
+            "project_methodology_text": "Agile with two-week sprints, CI/CD, testing and demos.",
+            "financial_justification_text": "Expected benefits and efficiency gains justify the investment.",
+            "payment_terms_text": "50% upfront, 50% on delivery. Proposal valid for 30 days.",
+            "development_note": "Includes development, QA, and DevOps efforts.",
+            "licenses_note": "Includes typical SaaS licenses and hosting.",
+            "support_note": "Includes 3 months of post-launch support."
+        }
+        return json.dumps(stub, ensure_ascii=False)
 
-    prompt = _build_prompt(proposal, tone)
-    prompt_hash = _hash_text(prompt + (tone or ""))
+    prompt_str = _build_prompt(proposal, tone)
+    prompt_key = _prompt_hash(prompt_str + (tone or ""))
 
-    # 1) try cache (fast)
+    # try cached fast path (only uses new OpenAI client)
     try:
-        cached = _call_model_cached(prompt, OPENAI_MODEL)
+        cached = _invoke_openai_cached(prompt_str, OPENAI_MODEL)
         if cached:
-            logger.debug("OpenAI: cache hit for prompt %s", prompt_hash)
+            logger.info("Cache hit for prompt %s model=%s", prompt_key, OPENAI_MODEL)
             return cached
     except Exception:
-        logger.debug("Cache check failed or miss; proceeding to live request")
+        logger.debug("Cache check failed/miss; proceeding to live call", exc_info=True)
 
-    last_exc: Optional[Exception] = None
+    last_reason = ""
+    last_exc = None
 
     for attempt in range(1, OPENAI_RETRY_ATTEMPTS + 1):
         try:
-            logger.debug("OpenAI: calling model=%s attempt %d/%d (hash %s)",
-                         OPENAI_MODEL, attempt, OPENAI_RETRY_ATTEMPTS, prompt_hash)
-            result = _invoke_chat_completion(prompt, OPENAI_MODEL)
-            # store to cache via cached wrapper (best-effort)
-            try:
-                _call_model_cached(prompt, OPENAI_MODEL)
-            except Exception:
-                pass
-            if result:
-                return result
-            logger.warning("OpenAI returned empty result (attempt %d).", attempt)
-        except RateLimitError as e:
-            logger.warning("OpenAI RateLimitError (attempt %d): %s", attempt, str(e))
-            last_exc = e
-            # Try fallback model once
-            if OPENAI_FALLBACK_MODEL and OPENAI_FALLBACK_MODEL != OPENAI_MODEL:
+            logger.info("Attempting OpenAI new client call model=%s attempt=%d/%d", OPENAI_MODEL, attempt, OPENAI_RETRY_ATTEMPTS)
+            res = _call_openai_new_client(prompt_str, OPENAI_MODEL)
+            if res:
                 try:
-                    logger.info("Switching to fallback model %s due to rate limit.", OPENAI_FALLBACK_MODEL)
-                    fallback_res = _invoke_chat_completion(prompt, OPENAI_FALLBACK_MODEL)
-                    if fallback_res:
-                        return fallback_res
-                except Exception as fe:
-                    logger.warning("Fallback model failed: %s", fe)
-            # break to avoid wasting quota
-            break
-        except OpenAIPermissionError as e:
-            logger.error("OpenAI permission/region error: %s", e)
-            last_exc = e
-            break
-        except OpenAIError as e:
-            logger.warning("OpenAIError on attempt %d: %s", attempt, e)
-            last_exc = e
+                    _invoke_openai_cached.cache_clear()
+                    _invoke_openai_cached(prompt_str, OPENAI_MODEL)
+                except Exception:
+                    pass
+                return res
+            last_reason = "openai_empty"
+            logger.warning("OpenAI returned empty on attempt %d", attempt)
         except Exception as e:
-            logger.exception("Unexpected error when calling OpenAI (attempt %d): %s", attempt, e)
             last_exc = e
+            last_reason = f"{type(e).__name__}:{e}"
+            logger.exception("OpenAI new client error on attempt %d: %s", attempt, last_reason)
+            # If this is clearly a "no new client available" or instantiation problem, don't retry
+            if "openai.OpenAI client class not available" in str(e) or "Failed to instantiate openai.OpenAI client" in str(e):
+                break
 
-        # backoff
         if attempt < OPENAI_RETRY_ATTEMPTS:
             backoff = OPENAI_RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
             jitter = random.random() * (backoff * 0.5)
-            sleep_for = backoff + jitter
-            logger.debug("Sleeping %.2fs before retry...", sleep_for)
-            time.sleep(sleep_for)
+            sleep_time = backoff + jitter
+            logger.debug("Sleeping %.2fs before retry...", sleep_time)
+            time.sleep(sleep_time)
 
-    # if we reach here — everything failed or unrecoverable
-    if last_exc:
-        logger.error("OpenAI calls failed: %s", last_exc)
-    else:
-        logger.error("OpenAI returned no content and no exception; returning fallback.")
+    # OpenAI new-client failed -> try HuggingFace fallback
+    logger.info("OpenAI new-client attempts exhausted; trying Hugging Face fallback. reason=%s", last_reason)
+    hf_text, hf_reason = _call_huggingface(prompt_str)
+    if hf_text:
+        logger.info("Hugging Face fallback succeeded: %s", hf_reason)
+        return hf_text
 
-    # final fallback: return fallback stub (safer than empty string)
-    return _fallback_stub(proposal)
+    logger.warning("Hugging Face fallback failed reason=%s; returning deterministic stub.", hf_reason)
+    client_name = proposal.get("client_name", "Client")
+    stub = {
+        "executive_summary_text": f"This is a fallback executive summary for {client_name}.",
+        "project_mission_text": "Deliver a reliable, maintainable solution that provides measurable business value.",
+        "solution_concept_text": "We propose a pragmatic architecture using modular services and reliable third-party platforms.",
+        "project_methodology_text": "Agile with two-week sprints, CI/CD, testing and demos.",
+        "financial_justification_text": "Expected benefits and efficiency gains justify the investment.",
+        "payment_terms_text": "50% upfront, 50% on delivery. Proposal valid for 30 days.",
+        "development_note": "Includes development, QA, and DevOps efforts.",
+        "licenses_note": "Includes typical SaaS licenses and hosting.",
+        "support_note": "Includes 3 months of post-launch support."
+    }
+    return json.dumps(stub, ensure_ascii=False)
