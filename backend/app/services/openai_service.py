@@ -77,9 +77,11 @@ def _build_prompt(proposal: Dict[str, Any], tone: str = "Formal") -> str:
     }.get(tone, "Use a neutral and professional tone.")
 
     prompt = f"""
-You are an expert commercial proposal writer. RETURN EXACTLY ONE VALID JSON OBJECT and NOTHING ELSE.
-The object must contain exactly these keys (strings): executive_summary_text, project_mission_text, solution_concept_text,
-project_methodology_text, financial_justification_text, payment_terms_text, development_note, licenses_note, support_note.
+You are an expert commercial proposal writer. RETURN EXACTLY ONE VALID JSON OBJECT AND NOTHING ELSE — no commentary, no markdown.
+The JSON must contain exactly these keys (strings):
+  executive_summary_text, project_mission_text, solution_concept_text,
+  project_methodology_text, financial_justification_text, payment_terms_text,
+  development_note, licenses_note, support_note
 
 Input:
 client_name: "{client}"
