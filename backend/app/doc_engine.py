@@ -1,4 +1,3 @@
-# backend/app/doc_engine.py
 import re
 import logging
 from io import BytesIO
@@ -14,9 +13,11 @@ PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
 
 # --- НАДЕЖНОЕ ФОРМАТИРОВАНИЕ ВАЛЮТЫ ---
 try:
+    # ru_RU.UTF-8 - для Linux/macOS
     locale.setlocale(locale.LC_ALL, 'ru_RU.UTF-8') 
 except locale.Error:
     try:
+        # Russian - для Windows
         locale.setlocale(locale.LC_ALL, 'Russian')
     except locale.Error:
         logger.warning("Could not set locale for Russian formatting. Using default string conversion.")
@@ -26,10 +27,11 @@ def _format_currency(value) -> str:
         return ""
     try:
         amount = float(value)
-        # ИСПРАВЛЕНО: Убран лишний пробел
+        # Форматирование с локализованными разделителями
         formatted_value = locale.format_string("%.2f", amount, grouping=True)
-        return f"{formatted_value}"
+        return f" {formatted_value}"
     except Exception:
+        # Резервный вариант: формат "1 234,56"
         try:
             return f"{float(value):,.2f}".replace(',', 'TEMP_SEP').replace('.', ',').replace('TEMP_SEP', ' ')
         except ValueError:
@@ -37,6 +39,10 @@ def _format_currency(value) -> str:
 # --------------------------------------
 
 def _replace_in_paragraph(paragraph, mapping: Dict[str, str]) -> None:
+    """
+    Заменяет плейсхолдеры в абзаце. Объединяет runs для поиска плейсхолдеров, 
+    разделенных форматированием, и затем записывает новый текст в один run.
+    """
     full_text = "".join(run.text for run in paragraph.runs)
     if not full_text:
         return
@@ -44,19 +50,22 @@ def _replace_in_paragraph(paragraph, mapping: Dict[str, str]) -> None:
     new_text = full_text
     found_placeholders = False
     
+    # Ищем и заменяем плейсхолдеры
     for k, v in mapping.items():
         placeholder = f"{{{{{k}}}}}"
         if placeholder in new_text:
-            # Используем (v or "") для обработки None или пустых строк
             new_text = new_text.replace(placeholder, v or "")
             found_placeholders = True
             
     if found_placeholders and new_text != full_text:
+        # Если была замена: очищаем все runs и записываем новый текст
         for run in paragraph.runs:
             run.text = ""
+        # Сохранение стиля абзаца
         paragraph.add_run(new_text)
 
 def _replace_in_table(table: Table, mapping: Dict[str, str]) -> None:
+    """Заменяет плейсхолдеры во всех ячейках таблицы."""
     for row in table.rows:
         for cell in row.cells:
             for para in cell.paragraphs:
@@ -66,6 +75,7 @@ def _replace_in_table(table: Table, mapping: Dict[str, str]) -> None:
                     logger.exception("Paragraph replacement in table cell failed; continuing.")
 
 def _replace_in_header_footer(container, mapping: Dict[str, str]) -> None:
+    """Заменяет плейсхолдеры в колонтитулах и таблицах колонтитулов."""
     if container is None:
         return
     for para in container.paragraphs:
@@ -81,6 +91,7 @@ def _replace_in_header_footer(container, mapping: Dict[str, str]) -> None:
                 logger.exception("Header/footer table replacement failed; continuing.")
 
 def _find_table_by_headers(doc: Document, headers: List[str]) -> Optional[Table]:
+    """Находит первую таблицу, чья первая строка содержит все заданные заголовки."""
     headers_lower = [h.lower() for h in headers]
     for table in doc.tables:
         if not table.rows:
@@ -88,13 +99,15 @@ def _find_table_by_headers(doc: Document, headers: List[str]) -> Optional[Table]
         first_row = table.rows[0]
         cells_text = [c.text.strip().lower() for c in first_row.cells]
         
+        # Проверяем, что КАЖДЫЙ искомый заголовок содержится в тексте ячеек первой строки
         if all(any(h in ct for ct in cells_text) for h in headers_lower):
             return table
     return None
 
 def _append_deliverables(table: Table, deliverables: List[Dict[str, str]], max_rows: int = 200):
     """
-    ИСПРАВЛЕНО: Ожидает 'acceptance_criteria' из main.py
+    Добавляет строки с Deliverables.
+    Ожидаемые ключи в элементах: "title", "description", "acceptance".
     """
     for d in deliverables[:max_rows]:
         try:
@@ -102,16 +115,21 @@ def _append_deliverables(table: Table, deliverables: List[Dict[str, str]], max_r
             cells = row.cells
             cells_count = len(cells)
             
+            # Обеспечиваем, что при отсутствии ячеек 2 и 3 не будет IndexError
             if cells_count >= 3:
                 cells[0].text = d.get("title", "")
                 cells[1].text = d.get("description", "")
-                cells[2].text = d.get("acceptance_criteria", "") # <--- ИСПРАВЛЕНО
-            else:
-                cells[0].text = f"{d.get('title','')} - {d.get('description','')} - {d.get('acceptance_criteria','')}"
+                cells[2].text = d.get("acceptance", "")
+            elif cells_count == 2:
+                 cells[0].text = d.get("title", "")
+                 cells[1].text = f"{d.get('description','')} / {d.get('acceptance','')}"
+            else: # cells_count == 1
+                cells[0].text = f"{d.get('title','')} - {d.get('description','')} - {d.get('acceptance','')}"
                 
         except Exception:
             logger.exception("Failed adding deliverable row; writing fallback")
             try:
+                # Резервная запись сырого представления
                 row = table.add_row()
                 row.cells[0].text = str(d)
             except Exception:
@@ -119,7 +137,8 @@ def _append_deliverables(table: Table, deliverables: List[Dict[str, str]], max_r
 
 def _append_timeline(table: Table, phases: List[Dict[str, str]], max_rows: int = 200):
     """
-    ИСПРАВЛЕНО: Ожидает 'phase_name' и 'duration_weeks' из main.py
+    Добавляет строки с Phases.
+    Ожидаемые ключи в элементах: "phase_name", "duration", "tasks".
     """
     for p in phases[:max_rows]:
         try:
@@ -127,12 +146,16 @@ def _append_timeline(table: Table, phases: List[Dict[str, str]], max_rows: int =
             cells = row.cells
             cells_count = len(cells)
 
+            # Обеспечиваем, что при отсутствии ячеек 2 и 3 не будет IndexError
             if cells_count >= 3:
-                cells[0].text = p.get("phase_name", "") # <--- ИСПРАВЛЕНО
-                cells[1].text = str(p.get("duration_weeks", "")) # <--- ИСПРАВЛЕНО
+                cells[0].text = p.get("phase_name", "")
+                cells[1].text = str(p.get("duration", ""))
                 cells[2].text = p.get("tasks", "")
-            else:
-                cells[0].text = f"{p.get('phase_name','')} - {p.get('duration_weeks','')} - {p.get('tasks','')}"
+            elif cells_count == 2:
+                 cells[0].text = p.get("phase_name", "")
+                 cells[1].text = f"Duration: {p.get('duration','')} / Tasks: {p.get('tasks','')}"
+            else: # cells_count == 1
+                cells[0].text = f"{p.get('phase_name','')} - {p.get('duration','')} - {p.get('tasks','')}"
                 
         except Exception:
             logger.exception("Failed adding timeline row; writing fallback")
@@ -182,5 +205,5 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
     # 6. Сохранение в BytesIO
     out = BytesIO()
     doc.save(out)
-    out.seek(0)
+    out.seek(0) 
     return out

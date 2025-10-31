@@ -275,8 +275,80 @@ async def suggest_content(proposal: ProposalInput = Body(...)):
         return JSONResponse(status_code=500, content={"detail": "Suggestion generation failed."})
 
 # ------------------- Placeholder for Gantt generation -------------------
-def _generate_gantt_bytes(phases: List[Dict[str, Any]]):
+# Потребуются импорты вверху файла
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from io import BytesIO
+from datetime import datetime, timedelta
+
+def _generate_gantt_bytes(phases: List[Dict[str, Any]], start_date: date = None) -> Optional[BytesIO]:
     """
-    Placeholder for Gantt chart generation.
+    Генерирует PNG диаграммы Ганта из списка фаз.
     """
-    return None
+    if not phases:
+        return None
+
+    if start_date is None:
+        start_date = datetime.utcnow().date()
+
+    # 1. Подготовка данных
+    phase_names = []
+    start_dates = []
+    end_dates = []
+    
+    current_start = start_date
+    
+    for phase in phases:
+        # doc_engine ожидает 'phase_name' и 'duration_weeks'
+        # Но _prepare_list_data в main.py переименовывает 
+        # 'duration_weeks' -> 'duration' и 'phases' -> 'phases_list'
+        # Поэтому мы ожидаем 'phase_name' и 'duration' (из _prepare_list_data)
+        
+        phase_name = phase.get("phase_name", "Phase")
+        # Убедимся, что используем правильный ключ (в main.py он 'duration')
+        duration_weeks = int(phase.get("duration", phase.get("duration_weeks", 1))) 
+        
+        phase_names.append(phase_name)
+        start_dates.append(current_start)
+        
+        end_date = current_start + timedelta(weeks=duration_weeks)
+        end_dates.append(end_date)
+        
+        # Следующая фаза начинается после окончания этой
+        current_start = end_date + timedelta(days=1) 
+
+    # 2. Создание графика
+    try:
+        fig, ax = plt.subplots(figsize=(10, len(phase_names) * 0.5 + 1))
+
+        # matplotlib ожидает "дни с начала эпохи" для дат
+        start_nums = [mdates.date2num(d) for d in start_dates]
+        end_nums = [mdates.date2num(d) for d in end_dates]
+        durations = [e - s for s, e in zip(start_nums, end_nums)]
+
+        ax.barh(phase_names, durations, left=start_nums, height=0.6, align='center')
+
+        # 3. Форматирование
+        ax.set_yticks(range(len(phase_names)))
+        ax.set_yticklabels(phase_names)
+        ax.invert_yaxis()  # Первая фаза сверху
+
+        ax.xaxis_date() # Используем форматтер дат
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        fig.autofmt_xdate() # Авто-поворот дат
+
+        ax.set_title('Project Timeline')
+        ax.set_xlabel('Date')
+        ax.grid(True, linestyle=':', alpha=0.7)
+        plt.tight_layout()
+
+        # 4. Сохранение в BytesIO
+        buf = BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        plt.close(fig) # Закрываем фигуру, чтобы избежать утечек памяти
+        buf.seek(0)
+        return buf
+        
+    except Exception as e:
+        logger.exception("Gantt chart generation failed: %s", e)
+        return None

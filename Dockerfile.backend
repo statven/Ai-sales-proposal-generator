@@ -1,0 +1,31 @@
+# Dockerfile.backend
+
+# Используем официальный Python образ
+FROM python:3.11-slim
+
+# Установка переменных окружения
+ENV PYTHONUNBUFFERED 1
+ENV APP_HOME=/app
+WORKDIR $APP_HOME
+
+# Копируем файл зависимостей и устанавливаем их
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем исходный код. 
+# В зависимости от структуры проекта, файлы (ai_core.py, db.py, main.py и т.д.) 
+# должны быть внутри директории 'backend/app'.
+COPY backend/ $APP_HOME/backend/ 
+COPY template.docx $APP_HOME/template.docx
+
+# Создаем директорию для SQLite DB
+RUN mkdir -p /data
+ENV PROPOSAL_DB_PATH="/data/proposals.db"
+
+# Открываем порт для FastAPI
+EXPOSE 8000
+
+# Запуск приложения через Uvicorn (или Gunicorn)
+# Предполагаем, что главный файл - main.py, а приложение называется 'app'.
+# Используем uvicorn с настройками для продакшена (workers)
+CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
