@@ -15,9 +15,9 @@ class ToneEnum(str, Enum):
     Маркетирование = "Marketing"
 
 class Deliverable(BaseModel):
-    title: str = Field(..., min_length=3, max_length=200)
+    title: str = Field(..., min_length=2, max_length=200)             
     description: str = Field(..., min_length=10, max_length=2000)
-    acceptance_criteria: str = Field(..., min_length=3, max_length=1000)
+    acceptance_criteria: str = Field(..., min_length=2, max_length=1000)  
 
 class Phase(BaseModel):
     duration_weeks: int = Field(..., ge=1, le=52)
@@ -29,7 +29,6 @@ class Financials(BaseModel):
     support_cost: Optional[float] = Field(None, ge=0)
 
 class ProposalInput(BaseModel):
-    # Primary canonical field names (used in code)
     client_name: str = Field(..., min_length=2, max_length=200, alias="client_company_name")
     provider_name: str = Field(..., min_length=2, max_length=200, alias="provider_company_name")
 
@@ -53,6 +52,18 @@ class ProposalInput(BaseModel):
     client_signature_date: Optional[date] = None
     provider_signature_name: Optional[str] = Field(None)
     provider_signature_date: Optional[date] = None
+    @property
+    def client_company_name(self) -> str:
+        return getattr(self, "client_name", "")
+
+    @property
+    def provider_company_name(self) -> str:
+        return getattr(self, "provider_name", "")
+
+    class Config:
+        allow_population_by_field_name = True
+        allow_population_by_field_alias = True
+        use_enum_values = True
 
     @field_validator("technologies", mode="before")
     @classmethod
@@ -81,3 +92,4 @@ class ProposalInput(BaseModel):
         allow_population_by_field_alias = True
         # keep enum values as strings in .dict() / .json()
         use_enum_values = True
+    

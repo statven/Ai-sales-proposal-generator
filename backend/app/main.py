@@ -14,12 +14,14 @@ import asyncio
 
 logger = logging.getLogger("uvicorn.error")
 
-# --- optional imports from your project (best-effort; keep app runnable if missing) ---
+doc_engine = None
 try:
-    from backend.app.doc_engine import render_docx_from_template
-except Exception:
-    render_docx_from_template = None
-    logger.warning("doc_engine not importable; DOCX generation disabled in this environment.")
+    import backend.app.doc_engine as doc_engine
+except Exception as e:
+    # Если импорт не удался, doc_engine останется None
+    logger.warning("doc_engine not importable; DOCX generation disabled in this environment. Error: %s", e)
+
+
 
 try:
     from backend.app.models import ProposalInput
@@ -254,12 +256,12 @@ def _sanitize_ai_text(s: Optional[str], context: Dict[str, Any]) -> str:
     return text
 
 # ----------------- End helpers -----------------
-
 @app.post("/api/v1/generate-proposal", tags=["Proposal Generation"])
 async def generate_proposal(payload: Dict[str, Any] = Body(...)):
-    if render_docx_from_template is None:
+    # ИСПРАВЛЕНО: Проверяем doc_engine и наличие функции
+    if doc_engine is None or not hasattr(doc_engine, "render_docx_from_template"):
         raise HTTPException(status_code=503, detail="Document engine is not available on this server.")
-
+    # ...
     normalized = _normalize_incoming_payload(payload)
 
     try:
@@ -290,7 +292,18 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
             raise HTTPException(status_code=500, detail=f"AI generation failed: {type(e).__name__}")
 
     # Build context
-    context = proposal.dict()
+    # Build context for doc engine
+    context = proposal.dict() if hasattr(proposal, "dict") else (proposal.model_dump() if hasattr(proposal, "model_dump") else dict(proposal.__dict__))
+    # Ensure alias access (also add alias names to context for template)
+    context["client_company_name"] = context.get("client_name") or context.get("client_company_name","")
+    context["provider_company_name"] = context.get("provider_name") or context.get("provider_company_name","")
+
+    # signature fields: prefer values from original normalized payload if provided
+    context["client_signature_name"] = payload.get("client_signature_name") or context.get("client_signature_name","")
+    context["client_signature_date"] = payload.get("client_signature_date") or context.get("client_signature_date","")
+    context["provider_signature_name"] = payload.get("provider_signature_name") or context.get("provider_signature_name","")
+    context["provider_signature_date"] = payload.get("provider_signature_date") or context.get("provider_signature_date","")
+
     # keep UI helper dates if provided originally
     if "proposal_date" in payload:
         context["proposal_date"] = payload.get("proposal_date")
@@ -298,9 +311,7 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
         context["valid_until_date"] = payload.get("valid_until_date")
     # signatures: ensure keys exist (avoid leaving placeholders un-replaced)
     # Если пользователь не передал имя/дату подписи — подставляем видимый заполнитель
-    default_sig_line = "_________________________"
-    context["client_signature_name"] = context.get("client_signature_name") or default_sig_line
-    context["provider_signature_name"] = context.get("provider_signature_name") or default_sig_line
+
 
     # даты подписи — оставляем пустыми если не заданы (в формате dd Month YYYY если заданы)
     context["client_signature_date"] = _format_date(context.get("client_signature_date"))
@@ -381,7 +392,17 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
     # Now render_docx_from_template(...) can safely replace {{client_signature_name}} etc.
 
     try:
-        doc_out = render_docx_from_template(TEMPLATE_PATH, context)
+        # УПРОЩЕНО: Убираем дублирующуюся проверку, оставляем вызов через doc_engine
+        if doc_engine and hasattr(doc_engine, "render_docx_from_template"):
+            doc_out = doc_engine.render_docx_from_template(TEMPLATE_PATH, context)
+        else:
+            # Этот блок нужен только если doc_engine != None, но функция в нем отсутствует
+            # (но мы уже проверили doc_engine is None в начале)
+            raise HTTPException(status_code=503, detail="Document engine is not available or badly configured.")
+
+    except HTTPException:
+        # re-raise 503 from inner check
+        raise
     except Exception as e:
         logger.exception("DOCX rendering failed: %s", e)
         raise HTTPException(status_code=500, detail=f"DOCX rendering failed: {str(e)}")
@@ -395,7 +416,9 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
         elif isinstance(doc_out, (bytes, bytearray)):
             doc_bytes = bytes(doc_out)
         else:
-            doc_bytes = bytes(doc_out)
+            # Added more explicit error handling for unexpected return type
+            logger.error("DOCX generation returned unexpected type: %s", type(doc_out))
+            raise TypeError("DOCX generation returned unexpected type")
     except Exception as e:
         logger.exception("Failed to extract bytes from doc engine output: %s", e)
         raise HTTPException(status_code=500, detail="DOCX generation returned unexpected type")
@@ -417,15 +440,15 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
 
 
 
-
 @app.post("/proposal/regenerate", tags=["Proposal Generation"])
 async def regenerate_proposal(body: Dict[str, Any] = Body(...)):
     """
     Regenerate a proposal by version_id (body={"version_id": 123}) or by passing a full payload (same shape as /api/v1/generate-proposal).
     """
-    if render_docx_from_template is None:
+    # ИСПРАВЛЕНО: Проверяем doc_engine и наличие функции
+    if doc_engine is None or not hasattr(doc_engine, "render_docx_from_template"):
         raise HTTPException(status_code=503, detail="Document engine is not available on this server.")
-
+    # ...
     version_id = body.get("version_id")
     if version_id:
         # load from DB
@@ -502,7 +525,7 @@ async def regenerate_proposal(body: Dict[str, Any] = Body(...)):
             if isinstance(val, date):
                 return val.strftime("%d %B %Y")
         except Exception:
-            pass
+                pass
         return str(val)
 
     # Default visible line for missing name (so placeholder doesn't disappear visually)
@@ -519,7 +542,17 @@ async def regenerate_proposal(body: Dict[str, Any] = Body(...)):
     # Now render_docx_from_template(...) can safely replace {{client_signature_name}} etc.
 
     try:
-        doc_out = render_docx_from_template(TEMPLATE_PATH, context)
+        # УПРОЩЕНО: Убираем дублирующуюся проверку, оставляем вызов через doc_engine
+        if doc_engine and hasattr(doc_engine, "render_docx_from_template"):
+            doc_out = doc_engine.render_docx_from_template(TEMPLATE_PATH, context)
+        else:
+            # Этот блок нужен только если doc_engine != None, но функция в нем отсутствует
+            # (но мы уже проверили doc_engine is None в начале)
+            raise HTTPException(status_code=503, detail="Document engine is not available or badly configured.")
+
+    except HTTPException:
+        # re-raise 503 from inner check
+        raise
     except Exception as e:
         logger.exception("Regeneration DOCX rendering failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Regeneration failed: {str(e)}")
@@ -532,7 +565,9 @@ async def regenerate_proposal(body: Dict[str, Any] = Body(...)):
         elif isinstance(doc_out, (bytes, bytearray)):
             doc_bytes = bytes(doc_out)
         else:
-            doc_bytes = bytes(doc_out)
+            # Added more explicit error handling for unexpected return type
+            logger.error("Regeneration returned unexpected type: %s", type(doc_out))
+            raise TypeError("Regeneration returned unexpected type")
     except Exception as e:
         logger.exception("Failed to extract bytes on regen: %s", e)
         raise HTTPException(status_code=500, detail="Regeneration returned unexpected type")
@@ -545,6 +580,7 @@ async def regenerate_proposal(body: Dict[str, Any] = Body(...)):
 
     return StreamingResponse(BytesIO(doc_bytes), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers=headers)
 
+    
 @app.post("/api/v1/suggest", tags=["AI Suggestions"])
 async def suggest_content(payload: Dict[str, Any] = Body(...)):
     """
@@ -557,13 +593,14 @@ async def suggest_content(payload: Dict[str, Any] = Body(...)):
 
     normalized = _normalize_incoming_payload(payload)
 
-    # validate minimal shape (we only need brief to generate suggestions)
+    # For suggestions we accept lighter inputs: try to validate, but if validation fails,
+    # log and continue with the normalized payload (suggestions use brief context).
     try:
-        # Use ProposalInput validation to ensure payload makes sense
         ProposalInput(**normalized)
     except ValidationError as ve:
-        logger.warning("Suggestion request validation failed: %s", ve.json())
-        return JSONResponse(status_code=422, content={"detail": ve.errors()})
+        logger.warning("Suggestion request validation failed but continuing anyway (suggestions don't require full validation): %s", ve.errors())
+        # continue with normalized payload (do not return 422)
+
 
     try:
         # expected to return a dict/json

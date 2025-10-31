@@ -14,7 +14,7 @@ def patch_doc_and_db_and_ai(monkeypatch):
     # mock render_docx_from_template to return BytesIO-like object
     fake_doc = MagicMock()
     fake_doc.getvalue.return_value = b"DOCX_BYTES"
-    monkeypatch.setattr("backend.app.main.render_docx_from_template", lambda tpl, context: fake_doc)
+    monkeypatch.setattr("backend.app.doc_engine.render_docx_from_template", lambda tpl, context: fake_doc)
     # mock db.save_version and db.get_version if exists
     try:
         import backend.app.db as dbmod
