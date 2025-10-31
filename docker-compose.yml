@@ -1,4 +1,4 @@
-version: '3.8'
+version: "3.8"
 
 services:
   backend:
@@ -6,39 +6,39 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     container_name: proposal_backend
-    # Маппинг порта 8000 контейнера на порт 8000 хоста
     ports:
       - "8000:8000"
     environment:
-      # Секреты загружаются из файла .env (который нужно создать в корне)
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - PROPOSAL_DB_PATH=/data/proposals.db 
+      - PROPOSAL_DB_PATH=/data/proposals.db
+      - TEMPLATE_PATH=/app/docs/template.docx
     volumes:
-      # Сохранение базы данных (истории версий)
-      - proposal_data:/data 
-    restart: always
+      - proposal_data:/data
+      - ./docs:/app/docs:ro        # монтируем шаблон (чтобы его можно было править локально)
+      - ./backend:/app/backend:ro # (опционально) монтируем исходники для dev
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
 
   frontend:
     build:
       context: .
       dockerfile: Dockerfile.frontend
     container_name: proposal_frontend
-    # Порт 8501 Streamlit маппится на 8501 хоста
     ports:
       - "8501:8501"
     environment:
-      # Указываем Streamlit, что API доступен по имени сервиса 'backend'
       - PROPOSAL_API_BASE=http://backend:8000
-    # Фронтенд зависит от успешного запуска бэкенда
     depends_on:
-      - backend
-    restart: always
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./frontend:/app/frontend:ro
+    restart: unless-stopped
 
 volumes:
-  # Объем для постоянного хранения данных (SQLite DB)
   proposal_data:
-
-# Инструкции по запуску:
-# 1. Создайте файл .env в корне с ключами.
-# 2. Выполните: docker compose up --build

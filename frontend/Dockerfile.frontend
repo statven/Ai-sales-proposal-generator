@@ -1,0 +1,26 @@
+# Dockerfile.frontend
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV APP_HOME=/app
+WORKDIR $APP_HOME
+
+# Установим необходимые системные пакеты (если требуются)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копируем зависимости (предполагается frontend/requirements.txt либо общий requirements)
+COPY frontend/requirements.txt ./requirements-frontend.txt
+RUN pip install --no-cache-dir -r ./requirements-frontend.txt
+
+# Копируем фронтенд-скрипты
+COPY frontend/ ./frontend/
+WORKDIR /app/frontend
+
+# Экспорт базового URL бэкенда (по умолчанию в compose мы переопределим на http://backend:8000)
+ENV PROPOSAL_API_BASE="http://backend:8000"
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]

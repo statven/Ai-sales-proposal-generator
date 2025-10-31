@@ -17,18 +17,26 @@ import hashlib
 import re
 from typing import Dict, Any, Tuple, Optional
 from functools import lru_cache, wraps
+# Добавляем импорты для конкретных исключений
+import requests # Для сетевых ошибок в requests (хотя здесь используется client, все равно полезно)
 
 # try import openai
 try:
     import openai
+    # Импортируем специфические ошибки OpenAI
+    from openai import APIError as OpenAIAPIError, AuthenticationError as OpenAIAuthError, RateLimitError as OpenAIRateLimitError
 except Exception:
     openai = None
+    OpenAIAPIError = OpenAIRateLimitError = OpenAIAuthError = Exception # fallback
 
 # try import gemini
 try:
     import google.generativeai as genai
+    # Импортируем специфические ошибки Gemini
+    from google.api_core.exceptions import GoogleAPIError as GeminiAPIError, ResourceExhausted as GeminiRateLimitError
 except Exception:
     genai = None
+    GeminiAPIError = GeminiRateLimitError = Exception # fallback
 
 logger = logging.getLogger("uvicorn.error")
 

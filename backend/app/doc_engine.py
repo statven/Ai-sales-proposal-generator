@@ -1,5 +1,6 @@
 import re
 import logging
+import locale
 from io import BytesIO
 from typing import Dict, Any, List, Optional
 from docx import Document
@@ -18,7 +19,7 @@ try:
 except locale.Error:
     try:
         # Russian - для Windows
-        locale.setlocale(locale.LC_ALL, 'Russian')
+        locale.setlocale(locale.LC_ALL, 'Russian_Russia')
     except locale.Error:
         logger.warning("Could not set locale for Russian formatting. Using default string conversion.")
 
@@ -27,14 +28,13 @@ def _format_currency(value) -> str:
         return ""
     try:
         amount = float(value)
-        # Форматирование с локализованными разделителями
         formatted_value = locale.format_string("%.2f", amount, grouping=True)
-        return f" {formatted_value}"
+        # REMOVE space after $ for consistent appearance: "$45 000,00"
+        return f"{formatted_value}"
     except Exception:
-        # Резервный вариант: формат "1 234,56"
         try:
-            return f"{float(value):,.2f}".replace(',', 'TEMP_SEP').replace('.', ',').replace('TEMP_SEP', ' ')
-        except ValueError:
+            return f"{float(value):,.2f}".replace(',', 'TEMP').replace('.', ',').replace('TEMP', ' ')
+        except Exception:
             return str(value)
 # --------------------------------------
 
@@ -137,26 +137,26 @@ def _append_deliverables(table: Table, deliverables: List[Dict[str, str]], max_r
 
 def _append_timeline(table: Table, phases: List[Dict[str, str]], max_rows: int = 200):
     """
-    Добавляет строки с Phases.
-    Ожидаемые ключи в элементах: "phase_name", "duration", "tasks".
+    Append phases to table. Expects phases items to contain:
+      - phase_name (string, already numbered if needed)
+      - duration (string)
+      - tasks (string)
     """
     for p in phases[:max_rows]:
         try:
             row = table.add_row()
             cells = row.cells
-            cells_count = len(cells)
-
-            # Обеспечиваем, что при отсутствии ячеек 2 и 3 не будет IndexError
-            if cells_count >= 3:
-                cells[0].text = p.get("phase_name", "")
-                cells[1].text = str(p.get("duration", ""))
-                cells[2].text = p.get("tasks", "")
-            elif cells_count == 2:
-                 cells[0].text = p.get("phase_name", "")
-                 cells[1].text = f"Duration: {p.get('duration','')} / Tasks: {p.get('tasks','')}"
-            else: # cells_count == 1
-                cells[0].text = f"{p.get('phase_name','')} - {p.get('duration','')} - {p.get('tasks','')}"
-                
+            # normalize
+            name = p.get("phase_name", "")
+            duration = p.get("duration", "")
+            tasks = p.get("tasks", "")
+            if len(cells) >= 3:
+                cells[0].text = str(name)
+                cells[1].text = str(duration)
+                cells[2].text = str(tasks)
+            else:
+                # fallback: put everything in first cell
+                cells[0].text = f"{name} - {duration} - {tasks}"
         except Exception:
             logger.exception("Failed adding timeline row; writing fallback")
             try:
@@ -164,6 +164,7 @@ def _append_timeline(table: Table, phases: List[Dict[str, str]], max_rows: int =
                 row.cells[0].text = str(p)
             except Exception:
                 logger.exception("Even fallback write failed for timeline row")
+
 
 def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> BytesIO:
     """
@@ -178,7 +179,13 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
             mapping[k] = _format_currency(v)
         else:
             mapping[k] = "" if v is None else str(v)
-
+    if "client_company_name" in mapping and "client_name" not in mapping:
+        mapping["client_name"] = mapping["client_company_name"]
+    if "provider_company_name" in mapping and "provider_name" not in mapping:
+        mapping["provider_name"] = mapping["provider_company_name"]
+    # Keep backward compatibility keys
+    if "expected_completion_date" in mapping and "expected_date" not in mapping:
+        mapping["expected_date"] = mapping["expected_completion_date"]
     # 2. Замена плейсхолдеров в основном документе
     for para in doc.paragraphs:
         _replace_in_paragraph(para, mapping)

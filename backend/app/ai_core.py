@@ -1,9 +1,10 @@
 # backend/app/ai_core.py
 import json
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import asyncio
 import copy
+import os
 from datetime import datetime
 
 from backend.app.services.openai_service import generate_ai_json
@@ -166,12 +167,19 @@ async def generate_ai_sections(proposal: Dict[str, Any], tone: str = "Formal") -
         if blob2:
             try:
                 parsed2 = json.loads(blob2)
-            except Exception as e:
+            # ИСПРАВЛЕНО: используем конкретное исключение
+            except json.JSONDecodeError as e: 
                 logger.exception("Failed to parse fallback JSON blob: %s; raw: %s", e, blob2)
+                parsed2 = None
+            except Exception as e:
+                logger.exception("Failed to parse fallback JSON blob (General Error): %s; raw: %s", e, blob2)
                 parsed2 = None
         else:
             try:
                 parsed2 = json.loads(raw2)
+            # ИСПРАВЛЕНО: используем конкретное исключение
+            except json.JSONDecodeError:
+                parsed2 = None
             except Exception:
                 parsed2 = None
 
@@ -194,3 +202,25 @@ async def generate_ai_sections(proposal: Dict[str, Any], tone: str = "Formal") -
         logger.exception("Regeneration attempt failed: %s", e)
 
     return result
+async def process_ai_content(proposal: Dict[str, Any], tone: str = "Formal") -> Tuple[Dict[str, str], str]:
+    """
+    Thin orchestration wrapper expected by tests / main:
+      - Calls generate_ai_sections (async wrapper already present)
+      - Returns (sections_dict, used_model_string)
+    used_model_string is best-effort: prefers OPENAI_MODEL env var, otherwise marks 'fallback_safe' when fallback used.
+    """
+    used_model = os.getenv("OPENAI_MODEL") or "openai"
+    try:
+        sections = await generate_ai_sections(proposal, tone)
+        # if sections look like safe fallback (we use generate_ai_sections_safe text), try to mark used_model accordingly
+        if sections and isinstance(sections, dict):
+            # best-effort heuristic: if executive_summary_text contains "fallback" phrase, mark as fallback
+            exec_text = (sections.get("executive_summary_text") or "").lower()
+            if "fallback" in exec_text or "auto-generated fallback" in exec_text or "this proposal for" in exec_text:
+                used_model = "fallback_safe"
+        return sections, used_model
+    except Exception as e:
+        # On error, return safe defaults and indicate fallback
+        logger.exception("process_ai_content: underlying AI generation failed: %s", e)
+        safe = await generate_ai_sections_safe(proposal)
+        return safe, "fallback_safe"

@@ -1,0 +1,28 @@
+# Dockerfile.frontend
+
+# Используем официальный Python образ
+FROM python:3.11-slim
+
+# Установка переменных окружения
+ENV PYTHONUNBUFFERED 1
+ENV APP_HOME=/app
+WORKDIR $APP_HOME
+
+# Копируем файл зависимостей и устанавливаем их
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем скрипт Streamlit. 
+# Предполагаем, что streamlit_app.py находится в корне или в директории frontend/.
+COPY streamlit_app.py $APP_HOME/streamlit_app.py
+
+# Установка API URL бэкенда
+# Внутри Docker Compose контейнеры видят друг друга по именам сервисов.
+ENV PROPOSAL_API_BASE="http://backend:8000"
+
+# Открываем порт для Streamlit
+EXPOSE 8501
+
+# Запуск Streamlit
+# NOTE: Streamlit по умолчанию использует порт 8501.
+CMD ["streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
