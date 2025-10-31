@@ -1,33 +1,34 @@
-# backend/app/services/openai_service.py
 """
 Minimal, safe migration to use openai.OpenAI() client when available.
-
 Behavior:
 - Try to use new `openai.OpenAI()` client only.
 - Do NOT attempt legacy calls that trigger APIRemovedInV1 (Completion.create / ChatCompletion.create).
-- If OpenAI client is missing/unusable, skip OpenAI and try Hugging Face fallback.
+- If OpenAI client is missing/unusable, skip OpenAI and try Gemini (Google AI) fallback.
 - If both fail, return deterministic stub JSON.
 - Minimal changes to keep compatibility with ai_core/main (generate_ai_json returns str).
 """
-
 from __future__ import annotations
-
 import os
 import time
 import random
 import json
 import logging
 import hashlib
-from typing import Dict, Any, Tuple
+import re
+from typing import Dict, Any, Tuple, Optional
 from functools import lru_cache, wraps
-
-import requests
 
 # try import openai
 try:
     import openai
 except Exception:
     openai = None
+
+# try import gemini
+try:
+    import google.generativeai as genai
+except Exception:
+    genai = None
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -42,10 +43,9 @@ OPENAI_RETRY_ATTEMPTS = int(os.getenv("OPENAI_RETRY_ATTEMPTS", "3"))
 OPENAI_RETRY_BACKOFF_BASE = float(os.getenv("OPENAI_RETRY_BACKOFF_BASE", "1.0"))
 OPENAI_USE_STUB = os.getenv("OPENAI_USE_STUB", "0").lower() in ("1", "true", "yes")
 
-# Hugging Face fallback
-HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-HUGGINGFACE_INFERENCE_URL = os.getenv("HUGGINGFACE_INFERENCE_URL")
-HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "")
+# Gemini (Google AI) fallback
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash") # Используем быструю модель
 
 # If module-level api_key attribute exists, set it for best-effort compatibility
 if openai is not None and OPENAI_API_KEY:
@@ -94,7 +94,6 @@ tone: "{tone}"
 
 Instruction:
 {tone_instruction}
-
 For each field: write 1-4 concise sentences. If you cannot determine a field, set it to an empty string "".
 Do NOT include extra keys.
 
@@ -151,10 +150,30 @@ def _extract_text_from_openai_response(resp: Any) -> str:
                     return first.get("text") or ""
     except Exception:
         logger.debug("Failed to parse OpenAI response shape", exc_info=True)
+    
     try:
         return str(resp) or ""
     except Exception:
         return ""
+
+def _extract_json_blob(text: str) -> Optional[str]:
+    """
+    Find the first JSON object or array blob in a string.
+    """
+    if not text:
+        return None
+    
+    # Ищем первый { ... }
+    match_obj = re.search(r"\{.*\}", text, re.DOTALL)
+    if match_obj:
+        return match_obj.group(0)
+    
+    # Если не нашли, ищем [ ... ]
+    match_arr = re.search(r"\[.*\]", text, re.DOTALL)
+    if match_arr:
+        return match_arr.group(0)
+        
+    return None
 
 # ------------- OpenAI: NEW client only -------------
 def _call_openai_new_client(prompt_str: str, model_name: str) -> str:
@@ -199,6 +218,7 @@ def _call_openai_new_client(prompt_str: str, model_name: str) -> str:
             resp = create_fn(model=model_name, messages=messages, max_tokens=OPENAI_MAX_TOKENS, temperature=OPENAI_TEMPERATURE, request_timeout=OPENAI_REQUEST_TIMEOUT)
         except TypeError:
             resp = create_fn(model=model_name, messages=messages, max_tokens=OPENAI_MAX_TOKENS, temperature=OPENAI_TEMPERATURE)
+        
         text = _extract_text_from_openai_response(resp)
         logger.info("OpenAI new client returned result for model=%s", model_name)
         return text or ""
@@ -210,9 +230,11 @@ def _call_openai_new_client(prompt_str: str, model_name: str) -> str:
 def _cached_call(maxsize: int = 256):
     def deco(fn):
         cached = lru_cache(maxsize=maxsize)(fn)
+
         @wraps(fn)
         def wrapper(prompt_str: str, model_name: str):
             return cached(prompt_str, model_name)
+        
         wrapper.cache_clear = cached.cache_clear
         return wrapper
     return deco
@@ -222,43 +244,59 @@ def _invoke_openai_cached(prompt_str: str, model_name: str) -> str:
     # cached wrapper around new-client call
     return _call_openai_new_client(prompt_str, model_name)
 
-# ------------- Hugging Face fallback -------------
-def _call_huggingface(prompt_str: str) -> Tuple[str, str]:
-    if not HUGGINGFACE_INFERENCE_URL:
-        return "", "HuggingFace not configured"
-    headers = {}
-    if HUGGINGFACE_API_KEY:
-        headers["Authorization"] = f"Bearer {HUGGINGFACE_API_KEY}"
-    payload = {"inputs": prompt_str, "options": {"wait_for_model": True}}
-    try:
-        r = requests.post(HUGGINGFACE_INFERENCE_URL, headers=headers, json=payload, timeout=30)
-    except Exception as e:
-        return "", f"HF request error: {e}"
-    if r.status_code != 200:
-        return "", f"hf-status-{r.status_code}:{r.text}"
-    try:
-        data = r.json()
-        if isinstance(data, dict) and "generated_text" in data:
-            return data["generated_text"], "huggingface_success"
-        if isinstance(data, list):
-            first = data[0]
-            if isinstance(first, dict) and "generated_text" in first:
-                return first["generated_text"], "huggingface_success"
-            if isinstance(first, str):
-                return first, "huggingface_success"
-        if isinstance(data, str):
-            return data, "huggingface_success"
-        return r.text, "huggingface_success"
-    except Exception as e:
-        return "", f"hf-parse-error:{e}"
+# ------------- Gemini (Google AI) fallback -------------
+def _call_gemini(prompt_str: str) -> Tuple[str, str]:
+    """
+    Calls Google Gemini API as a fallback.
+    Returns (generated_text, reason)
+    """
+    if genai is None:
+        return "", "google-generativeai package not installed"
+    if not GOOGLE_API_KEY:
+        return "", "GOOGLE_API_KEY not set"
 
-# ------------- public entrypoint -------------
+    try:
+        genai.configure(api_key=GOOGLE_API_KEY)
+        
+        # Настройки безопасности (минимальные, чтобы разрешить JSON)
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+        
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        
+        # Важно: Gemini может отказаться генерировать JSON, если промпт содержит
+        # "instruction" на возврат *только* JSON.
+        # Промпты _build_prompt и _build_suggestion_prompt
+        # достаточно строгие (RETURN EXACTLY ONE JSON OBJECT)
+        
+        response = model.generate_content(
+            prompt_str,
+            safety_settings=safety_settings
+        )
+
+        if response.text:
+            return response.text, "gemini_success"
+        else:
+            # Обработка случая, если ответ пустой или заблокирован
+            feedback = response.prompt_feedback if hasattr(response, 'prompt_feedback') else 'unknown_reason'
+            logger.warning("Gemini returned empty or blocked response. Feedback: %s", feedback)
+            return "", f"gemini_empty_or_blocked: {feedback}"
+            
+    except Exception as e:
+        logger.exception("Gemini invocation failed: %s", e)
+        return "", f"gemini_error: {e}"
+
+# ------------- public entrypoint (AI sections) -------------
 def generate_ai_json(proposal: Dict[str, Any], tone: str = "Formal") -> str:
     """
     Returns model text or JSON string. Tries:
       1) cached new OpenAI client
       2) live OpenAI new client (retries)
-      3) Hugging Face fallback
+      3) Gemini (Google AI) fallback
       4) deterministic stub
     Always returns a str (never None).
     """
@@ -297,9 +335,10 @@ def generate_ai_json(proposal: Dict[str, Any], tone: str = "Formal") -> str:
             logger.info("Attempting OpenAI new client call model=%s attempt=%d/%d", OPENAI_MODEL, attempt, OPENAI_RETRY_ATTEMPTS)
             res = _call_openai_new_client(prompt_str, OPENAI_MODEL)
             if res:
+                # try to update cache
                 try:
-                    _invoke_openai_cached.cache_clear()
-                    _invoke_openai_cached(prompt_str, OPENAI_MODEL)
+                    _invoke_openai_cached.cache_clear() # crude invalidation
+                    _invoke_openai_cached(prompt_str, OPENAI_MODEL) # re-populate
                 except Exception:
                     pass
                 return res
@@ -312,7 +351,7 @@ def generate_ai_json(proposal: Dict[str, Any], tone: str = "Formal") -> str:
             # If this is clearly a "no new client available" or instantiation problem, don't retry
             if "openai.OpenAI client class not available" in str(e) or "Failed to instantiate openai.OpenAI client" in str(e):
                 break
-
+        
         if attempt < OPENAI_RETRY_ATTEMPTS:
             backoff = OPENAI_RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
             jitter = random.random() * (backoff * 0.5)
@@ -320,14 +359,14 @@ def generate_ai_json(proposal: Dict[str, Any], tone: str = "Formal") -> str:
             logger.debug("Sleeping %.2fs before retry...", sleep_time)
             time.sleep(sleep_time)
 
-    # OpenAI new-client failed -> try HuggingFace fallback
-    logger.info("OpenAI new-client attempts exhausted; trying Hugging Face fallback. reason=%s", last_reason)
-    hf_text, hf_reason = _call_huggingface(prompt_str)
-    if hf_text:
-        logger.info("Hugging Face fallback succeeded: %s", hf_reason)
-        return hf_text
+    # OpenAI new-client failed -> try Gemini fallback
+    logger.info("OpenAI new-client attempts exhausted; trying Gemini fallback. reason=%s", last_reason)
+    gemini_text, gemini_reason = _call_gemini(prompt_str)
+    if gemini_text:
+        logger.info("Gemini fallback succeeded: %s", gemini_reason)
+        return gemini_text
 
-    logger.warning("Hugging Face fallback failed reason=%s; returning deterministic stub.", hf_reason)
+    logger.warning("Gemini fallback failed reason=%s; returning deterministic stub.", gemini_reason)
     client_name = proposal.get("client_name", "Client")
     stub = {
         "executive_summary_text": f"This is a fallback executive summary for {client_name}.",
@@ -341,3 +380,189 @@ def generate_ai_json(proposal: Dict[str, Any], tone: str = "Formal") -> str:
         "support_note": "Includes 3 months of post-launch support."
     }
     return json.dumps(stub, ensure_ascii=False)
+
+
+# ----------------------------------------------
+# Suggestion generation: targeted prompts for deliverables/phases (returns dict)
+# ----------------------------------------------
+def _build_suggestion_prompt(proposal: Dict[str, Any], tone: str = "Formal", max_deliverables: int = 5, max_phases: int = 5) -> str:
+    """
+    Build a focused prompt asking the LLM to propose deliverables and phases.
+    Returns bilingual prompt (RU/EN short instructions) to improve locality.
+    The model MUST return exactly ONE JSON object and NOTHING ELSE.
+    """
+    client = proposal.get("client_name", "")
+    project_goal = proposal.get("project_goal", "")
+    scope = proposal.get("scope", "")
+    technologies = proposal.get("technologies") or []
+    techs = ", ".join(technologies) if isinstance(technologies, (list, tuple)) else str(technologies)
+
+    prompt = f"""
+You are an experienced delivery/project manager and proposal writer.
+
+Task (RU):
+На основе краткого брифа предложи список ключевых Deliverables (рекомендуется до {max_deliverables}) и Phases (рекомендуется до {max_phases}) для коммерческого предложения.
+Возвращай РОВНО ОДИН JSON-ОБЪЕКТ и НИЧЕГО КРОМЕ ЕГО — без markdown, без пояснений.
+
+Task (EN):
+Based on the brief below, propose up to {max_deliverables} deliverables and up to {max_phases} phases (timeline steps).
+Return EXACTLY ONE JSON OBJECT and NOTHING ELSE.
+
+Input:
+client_name: "{client}"
+project_goal: "{project_goal}"
+scope: "{scope}"
+technologies: "{techs}"
+tone: "{tone}"
+
+JSON schema to return (exactly this shape):
+{{
+  "suggested_deliverables": [
+    {{
+      "title": "<short title, max 8-10 words>",
+      "description": "<1-2 sentences describing the deliverable>",
+      "acceptance": "<acceptance criteria (1 sentence)>"
+    }}
+    // repeat up to {max_deliverables}
+  ],
+  "suggested_phases": [
+    {{
+      "phase_name": "<short name>",
+      "duration_weeks": <integer weeks>,
+      "tasks": "<short list or sentence of key tasks>"
+    }}
+    // repeat up to {max_phases}
+  ]
+}}
+
+Important:
+- Use realistic durations (integer weeks).
+- Keep titles concise.
+- Do not include any additional keys.
+- If uncertain, you may return empty arrays.
+"""
+    return prompt.strip()
+
+
+def generate_suggestions(proposal: Dict[str, Any], tone: str = "Formal", max_deliverables: int = 5, max_phases: int = 5) -> Dict[str, Any]:
+    """
+    Return a dict with keys 'suggested_deliverables' and 'suggested_phases'.
+    Tries OpenAI new client, then Gemini, then deterministic stub.
+    Always returns a dict (never raises for expected failure cases).
+    """
+    prompt = _build_suggestion_prompt(proposal, tone, max_deliverables=max_deliverables, max_phases=max_phases)
+    
+    # Try cached new-client path first
+    try:
+        # try to use cached invocation of new-client if available
+        cached = None
+        try:
+            # if caching wrapper exists for new client (name may differ), use a direct call to underlying function
+            cached = _invoke_openai_cached(prompt, OPENAI_MODEL)
+        except Exception:
+            cached = None
+        
+        if cached:
+            # cached is raw text; try parse JSON
+            try:
+                blob = _extract_text_from_openai_response(cached) if isinstance(cached, (dict, object)) else cached
+                blob = blob if isinstance(blob, str) else str(blob)
+                js = json.loads(_extract_json_blob(blob) or blob)
+                if isinstance(js, dict):
+                    return {
+                        "suggested_deliverables": js.get("suggested_deliverables", []),
+                        "suggested_phases": js.get("suggested_phases", [])
+                    }
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Live attempts (retries) using new-client call function if available
+    last_exc = None
+    for attempt in range(1, OPENAI_RETRY_ATTEMPTS + 1):
+        try:
+            # prefer new client call if available
+            try:
+                txt = _call_openai_new_client(prompt, OPENAI_MODEL)
+            except Exception:
+                # If new client not available, fall back to _invoke_openai_cached (which may call new client)
+                txt = _invoke_openai_cached(prompt, OPENAI_MODEL)
+            
+            if not txt:
+                last_exc = RuntimeError("empty response")
+                continue
+                
+            # try extract JSON blob
+            blob = txt if isinstance(txt, str) else str(txt)
+            json_blob = _extract_json_blob(blob)
+            parsed = None
+            if json_blob:
+                parsed = json.loads(json_blob)
+            else:
+                try:
+                    parsed = json.loads(blob)
+                except Exception:
+                    parsed = None
+
+            if isinstance(parsed, dict):
+                return {
+                    "suggested_deliverables": parsed.get("suggested_deliverables", []),
+                    "suggested_phases": parsed.get("suggested_phases", [])
+                }
+            # else: try to parse text response heuristically (not ideal)
+            last_exc = RuntimeError("Parsed non-dict")
+        except Exception as e:
+            last_exc = e
+            # backoff
+            if attempt < OPENAI_RETRY_ATTEMPTS:
+                backoff = OPENAI_RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                time.sleep(backoff + random.random() * 0.5)
+            continue
+
+    # OpenAI failed -> try Gemini
+    try:
+        gemini_text, gemini_reason = _call_gemini(prompt)
+        if gemini_text:
+            try:
+                blob = gemini_text if isinstance(gemini_text, str) else str(gemini_text)
+                json_blob = _extract_json_blob(blob)
+                parsed = None
+                if json_blob:
+                    parsed = json.loads(json_blob)
+                else:
+                    try:
+                        parsed = json.loads(blob)
+                    except Exception:
+                        parsed = None
+                if isinstance(parsed, dict):
+                    return {
+                        "suggested_deliverables": parsed.get("suggested_deliverables", []),
+                        "suggested_phases": parsed.get("suggested_phases", [])
+                    }
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # deterministic stub suggestions
+    client = proposal.get("client_name", "Client")
+    stub = {
+        "suggested_deliverables": [
+            {
+                "title": "Requirements & Analysis",
+                "description": f"Detailed requirements gathering and analysis for {client}.",
+                "acceptance": "Approved requirements document signed by client."
+            },
+            {
+                "title": "CRM Integration",
+                "description": "Design and implement CRM synchronization and admin panel.",
+                "acceptance": "Data sync tested and UAT accepted."
+            }
+        ],
+        "suggested_phases": [
+            {"phase_name": "Planning", "duration_weeks": 2, "tasks": "Requirements, scope, prototypes"},
+            {"phase_name": "Implementation", "duration_weeks": 8, "tasks": "Development, integration, tests"}
+        ]
+    }
+    return stub

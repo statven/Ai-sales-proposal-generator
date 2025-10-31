@@ -1,7 +1,7 @@
 # backend/app/db.py
 import os
 import json
-from datetime import datetime
+from datetime import datetime, date # Import date for custom serialization
 from typing import Optional, Dict, Any
 
 from sqlalchemy import create_engine, Column, Integer, DateTime, Text, String
@@ -12,6 +12,13 @@ os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 ENGINE = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, autocommit=False)
 Base = declarative_base()
+
+# FIX: Custom JSON encoder function to handle date/datetime objects
+def _json_default(obj):
+    """Fallback function for json.dumps to handle non-serializable objects."""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
 class ProposalVersion(Base):
     __tablename__ = "proposal_versions"
@@ -29,8 +36,9 @@ def save_version(payload: Dict[str, Any], ai_sections: Optional[Dict[str, Any]] 
     s = SessionLocal()
     try:
         pv = ProposalVersion(
-            payload=json.dumps(payload, ensure_ascii=False),
-            ai_sections=json.dumps(ai_sections or {}, ensure_ascii=False),
+            # FIX: Use custom default encoder
+            payload=json.dumps(payload, ensure_ascii=False, default=_json_default),
+            ai_sections=json.dumps(ai_sections or {}, ensure_ascii=False, default=_json_default),
             used_model=used_model,
             note=note
         )
@@ -51,7 +59,7 @@ def get_version(version_id: int) -> Optional[Dict[str, Any]]:
             "id": pv.id,
             "created_at": pv.created_at.isoformat(),
             "payload": json.loads(pv.payload),
-            "ai_sections": json.loads(pv.ai_sections) if pv.ai_sections else {},
+            "ai_sections": json.loads(pv.ai_sections or "{}"),
             "used_model": pv.used_model,
             "note": pv.note
         }

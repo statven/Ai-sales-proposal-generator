@@ -1,242 +1,282 @@
-# backend/app/main.py  (замените/дополните ваш текущий main.py)
 import logging
 import os
-from typing import Dict, Any, Optional
+import json 
+from typing import Dict, Any, Optional, List
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import ValidationError
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from io import BytesIO
 from urllib.parse import quote
 
-from backend.app.ai_core import generate_ai_sections, generate_ai_sections_safe
-from backend.app.doc_engine import render_docx_from_template
-from backend.app.models import ProposalInput, Deliverable, Phase
-from backend.app import db
+# ----------------------------------------------------
+# ЗАГЛУШКИ ДЛЯ ИМПОРТОВ: 
+# Предполагается, что эти модули существуют в вашем проекте
+try:
+    from backend.app.services import openai_service 
+except ImportError:
+    # ... (пропуск кода заглушки)
+    openai_service = None
+    logging.warning("openai_service not found. AI generation disabled.")
+
+try:
+    from backend.app.doc_engine import render_docx_from_template
+except ImportError:
+    render_docx_from_template = None
+    logging.warning("doc_engine not found. DOCX generation disabled.")
+
+try:
+    from backend.app.models import ProposalInput, Financials
+except ImportError:
+    # ... (пропуск кода заглушки)
+    class Financials: pass 
+    class ProposalInput: 
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+        def dict(self):
+            return self.__dict__
+    logging.warning("models.py not found. Using minimal model structure.")
+
+
+try:
+    from backend.app import db
+except ImportError:
+    # ... (пропуск кода заглушки)
+    class MockDB:
+        def init_db(self): pass
+        def save_version(self, *args, **kwargs): return 1
+        def get_version(self, version_id): 
+            return {'payload': '{"client_company_name": "Test Client", "provider_company_name": "Test Provider", "project_goal": "Goal", "scope": "Scope", "technologies": [], "deadline": "2025-12-31", "tone": "Formal", "proposal_date": "2025-01-01", "valid_until_date": "2025-01-31", "financials": {"development_cost": 1000.0, "licenses_cost": 0.0, "support_cost": 0.0}, "deliverables": [], "phases": []}',
+                    'ai_sections': '{}'}
+    db = MockDB()
+    logging.warning("db.py not found. Using mock database.")
+
+try:
+    from backend.app import ai_core
+except ImportError:
+    # ... (пропуск кода заглушки)
+    class MockAICore:
+        def generate_ai_sections(self, data): 
+            return {"executive_summary_text": "AI summary placeholder.", "used_model": "mock-llm"}
+    ai_core = MockAICore()
+    logging.warning("ai_core.py not found. Using mock AI core.")
+
+# ----------------------------------------------------
 
 logger = logging.getLogger("uvicorn.error")
-
 app = FastAPI(title="AI Sales Proposal Generator (Backend)")
 
-TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", r"D:\programming\ai-sales-proposal-generator\docs\template.docx")
+TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", os.path.join(os.getcwd(), "docs", "template.docx"))
 if not os.path.exists(TEMPLATE_PATH):
-    logger.warning("Template not found at %s. Please ensure template.docx is present.", TEMPLATE_PATH)
+    logger.warning("Template not found at %s. Ensure template.docx is present.", TEMPLATE_PATH)
 
-# init DB
 db.init_db()
 
-def _format_date(val) -> str:
+# --- Вспомогательные функции ---
+
+def _format_date(val: Any) -> str:
+    """Formats date/datetime object to ISO string."""
     if val is None:
         return ""
-    if isinstance(val, (date, datetime)):
-        return val.strftime("%d %B %Y")
-    try:
-        d = date.fromisoformat(str(val))
-        return d.strftime("%d %B %Y")
-    except Exception:
-        return str(val)
+    if isinstance(val, date):
+        return val.isoformat() 
+    if isinstance(val, str):
+        return val
+    return str(val)
 
 def _safe_filename(name: str) -> str:
-    return "".join(c for c in (name or "") if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_") or "proposal"
+    """Sanitize string for use in a filename."""
+    return "".join(c for c in name if c.isalnum() or c in (' ', '_', '-')).rstrip().replace(' ', '_')[:50]
 
-# Additional server-side validation beyond Pydantic
-def extra_validate_model(proposal: ProposalInput) -> Optional[Dict[str, Any]]:
-    errors = []
-    # deadline not in the past (allow today)
-    if proposal.deadline:
-        if isinstance(proposal.deadline, str):
-            # Pydantic already converted, but safety
-            try:
-                d = date.fromisoformat(proposal.deadline)
-            except Exception:
-                d = None
-        else:
-            d = proposal.deadline
-        if d and d < datetime.utcnow().date():
-            errors.append({"loc": ["deadline"], "msg": "deadline must not be in the past", "type": "value_error"})
-    # finances >= 0
-    fin = proposal.financials
-    if fin:
-        for attr in ("development_cost", "licenses_cost", "support_cost"):
-            val = getattr(fin, attr)
-            if val is not None and val < 0:
-                errors.append({"loc": [attr], "msg": "must be >= 0", "type": "value_error"})
-    if errors:
-        return {"detail": errors}
-    return None
+def _calculate_total_investment(financials_dict: Dict[str, Any]) -> float:
+    """Calculates the sum of development, licenses, and support costs."""
+    dev = financials_dict.get('development_cost')
+    lic = financials_dict.get('licenses_cost')
+    sup = financials_dict.get('support_cost')
+    
+    development_cost = float(dev) if dev is not None else 0.0
+    licenses_cost = float(lic) if lic is not None else 0.0
+    support_cost = float(sup) if sup is not None else 0.0
+    
+    return development_cost + licenses_cost + support_cost
 
-def _generate_gantt_bytes(phases: list) -> Optional[bytes]:
+def _prepare_list_data(context: Dict[str, Any]) -> None:
     """
-    Create a simple Gantt chart using Plotly and return PNG bytes.
-    phases: list of dicts with keys: phase_name, duration (e.g., '4 weeks') or duration_weeks, tasks
+    Исправляет несоответствие ключей между Pydantic моделями и doc_engine.py.
     """
-    try:
-        import plotly.express as px
-        import pandas as pd
-        # Normalize phases into start/end
-        rows = []
-        start = datetime.utcnow().date()
+    # 1. Deliverables: 'deliverables' -> 'deliverables_list' & 'acceptance_criteria' -> 'acceptance'
+    if 'deliverables' in context:
+        deliverables = context.pop('deliverables')
+        # ПЕРЕИМЕНОВАНИЕ КЛЮЧА
+        for d in deliverables:
+            if 'acceptance_criteria' in d:
+                d['acceptance'] = d.pop('acceptance_criteria')
+        context['deliverables_list'] = deliverables
+
+    # 2. Phases: 'phases' -> 'phases_list' & 'duration_weeks' -> 'duration'
+    if 'phases' in context:
+        phases = context.pop('phases')
+        # ПЕРЕИМЕНОВАНИЕ КЛЮЧА
         for p in phases:
-            duration_weeks = None
-            if isinstance(p, dict) and "duration" in p:
-                # expecting '4 weeks' format
-                try:
-                    duration_weeks = int(str(p["duration"]).split()[0])
-                except Exception:
-                    duration_weeks = 1
-            elif hasattr(p, "duration_weeks"):
-                duration_weeks = p.duration_weeks
-            else:
-                duration_weeks = 1
-            end = start + timedelta(weeks=duration_weeks)
-            rows.append({"Task": p.get("phase_name", "Phase"), "Start": start.isoformat(), "Finish": end.isoformat()})
-            start = end  # next starts when previous ends
-        if not rows:
-            return None
-        df = pd.DataFrame(rows)
-        fig = px.timeline(df, x_start="Start", x_end="Finish", y="Task")
-        fig.update_yaxes(autorange="reversed")
-        # export to PNG bytes using kaleido
-        img_bytes = fig.to_image(format="png", engine="kaleido")
-        return img_bytes
-    except Exception as e:
-        logger.exception("Gantt generation failed: %s", e)
-        return None
+            if 'duration_weeks' in p:
+                p['duration'] = p.pop('duration_weeks')
+        context['phases_list'] = phases
 
-def _generate_uml_bytes(proposal: Dict[str, Any]) -> Optional[bytes]:
+
+# --- Функции генерации и регенерации ---
+
+@app.post("/api/v1/generate-proposal", tags=["Proposal Generation"])
+async def generate_proposal(proposal: ProposalInput = Body(...)):
     """
-    Create a very small PlantUML diagram using PLANTUML_SERVER_URL (env) if provided.
-    Returns PNG bytes or None.
+    Generates the DOCX proposal document using a template and LLM-generated content.
     """
-    PLANTUML_SERVER = os.getenv("PLANTUML_SERVER_URL")
-    if not PLANTUML_SERVER:
-        return None
-    # Compose small UML (sequence) based on deliverables/phases
+    if not render_docx_from_template:
+          raise HTTPException(status_code=503, detail="Document engine is not available.")
+
+    # 1. Generate AI sections
     try:
-        # Basic PlantUML text
-        uml = "@startuml\ntitle Proposal overview\nactor Client\nparticipant Provider\nClient -> Provider: Request proposal\nProvider -> Provider: Prepare deliverables\nProvider -> Client: Deliver proposal\n@enduml"
-        # PlantUML server expects encoded payload in URL path (but many accept POST)
-        # We'll POST as plain text for servers that accept it
-        import requests
-        headers = {"Content-Type": "text/plain"}
-        r = requests.post(PLANTUML_SERVER, data=uml.encode("utf-8"), headers=headers, timeout=15)
-        if r.status_code == 200:
-            return r.content
-        else:
-            logger.warning("PlantUML server returned status %s: %s", r.status_code, r.text)
-            return None
+        ai_sections = await ai_core.generate_ai_sections(proposal.dict())
     except Exception as e:
-        logger.exception("UML generation failed: %s", e)
-        return None
+        logger.exception("AI generation failed: %s", e)
+        ai_sections = {}
 
-@app.post("/api/v1/generate-proposal")
-async def generate_proposal(payload: Dict[str, Any]):
-    # 1) Validate pydantic
+    # 2. Build rendering context
+    context = proposal.dict()
+    context.update(ai_sections)
+    
+    # === ИСПРАВЛЕНИЕ ТАБЛИЦ: Выравнивание имен ключей ===
+    _prepare_list_data(context)
+    # ==========================================
+    
+    # Flatten dates
+    context['current_date'] = _format_date(date.today())
+    context['expected_completion_date'] = _format_date(context.get('deadline'))
+    
+    # Prepare financials and CALCULATE TOTAL
+    if context.get("financials"):
+        fin_dict = context["financials"]
+        # Перенос всех финансовых полей на верхний уровень context
+        context.update(fin_dict)
+        
+        total_investment_cost = _calculate_total_investment(fin_dict)
+        context['total_investment_cost'] = total_investment_cost
+    
+    # 3. Render DOCX
     try:
-        proposal = ProposalInput(**payload)
-    except ValidationError as e:
-        logger.warning("Validation failed: %s", e.json())
-        return JSONResponse(status_code=422, content={"detail": e.errors()})
+        doc_bytes = render_docx_from_template(
+            template_path=TEMPLATE_PATH,
+            context=context
+        )
+    except Exception as e:
+        logger.exception("DOCX rendering failed: %s", e)
+        return JSONResponse(status_code=500, content={"detail": f"DOCX rendering failed: {e}"})
 
-    # 1.5) extra validation
-    extra = extra_validate_model(proposal)
-    if extra:
-        return JSONResponse(status_code=422, content=extra)
-
-    # 2) AI generation
-    used_model_info = "unknown"
+    # 4. Save to DB 
+    version_id = None
     try:
-        ai_sections = await generate_ai_sections(proposal.dict(), tone=getattr(proposal, "tone", "Formal"))
-        if not isinstance(ai_sections, dict):
-            raise RuntimeError("AI returned non-dict")
-        used_model_info = "ai_generated"
-    except Exception as exc:
-        logger.exception("Primary AI generation failed: %s — falling back to safe.", exc)
-        ai_sections = await generate_ai_sections_safe(proposal.dict())
-        used_model_info = "fallback_safe"
+        version_id = db.save_version(
+            proposal.dict(), 
+            ai_sections=ai_sections, 
+            used_model=ai_sections.get("used_model")
+        )
+    except Exception as e:
+        logger.exception("Failed to save proposal to DB: %s", e)
+    
+    # 5. Return file
+    filename = f"{_safe_filename(context.get('client_company_name') or 'proposal')}_{_safe_filename(context.get('project_goal') or 'doc')}.docx"
+    encoded_filename = quote(filename)
 
-    # 3) Financials
-    fin = proposal.financials or {}
-    dev = getattr(fin, "development_cost", 0) or 0
-    lic = getattr(fin, "licenses_cost", 0) or 0
-    sup = getattr(fin, "support_cost", 0) or 0
-    total = sum(float(x or 0) for x in [dev, lic, sup])
-
-    # 4) Gantt + UML
-    phases_input = []
-    for p in proposal.phases or []:
-        phases_input.append({"phase_name": f"Phase {len(phases_input)+1}", "duration": f"{p.duration_weeks} weeks", "tasks": p.tasks})
-    gantt_bytes = _generate_gantt_bytes(phases_input)
-    uml_bytes = _generate_uml_bytes(payload)
-
-    # 5) Build context
-    payload_dict = proposal.dict() if hasattr(proposal, "dict") else {}
-    context: Dict[str, Any] = {
-        "current_date": _format_date(datetime.utcnow().date()),
-        "client_company_name": proposal.client_name or "",
-        "provider_company_name": proposal.provider_name or "",
-        "expected_completion_date": _format_date(proposal.deadline),
-        "development_cost": dev,
-        "licenses_cost": lic,
-        "support_cost": sup,
-        "total_investment_cost": total,
-        **(ai_sections or {}),
-        "client_signature_name": payload_dict.get("client_signature_name", "") or "",
-        "client_signature_date": _format_date(payload_dict.get("client_signature_date", None)),
-        "provider_signature_name": payload_dict.get("provider_signature_name", "") or "",
-        "provider_signature_date": _format_date(payload_dict.get("provider_signature_date", None)),
-        "deliverables_list": [{"title": d.title, "description": d.description, "acceptance": d.acceptance_criteria} for d in (proposal.deliverables or [])],
-        "phases_list": phases_input,
-        "gantt_image": gantt_bytes,
-        "uml_image": uml_bytes,
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
     }
-
-    # 6) Render docx
-    try:
-        docx_io: BytesIO = render_docx_from_template(TEMPLATE_PATH, context)
-    except Exception as e:
-        logger.exception("Document generation failed: %s", e)
-        raise HTTPException(status_code=500, detail=f"Document generation failed: {str(e)}")
-
-    # 7) Save version to DB (store payload and ai_sections and used_model)
-    try:
-        version_id = db.save_version(payload=payload, ai_sections=ai_sections, used_model=used_model_info, note="generated")
-        logger.info("Saved proposal version id=%s", version_id)
-    except Exception:
-        logger.exception("Failed to save version to DB, continuing without versioning.")
-
-    # 8) Streaming response
-    filename_raw = f"proposal_{proposal.client_name or 'proposal'}.docx"
-    quoted = quote(filename_raw, safe="")
-    content_disposition = f"attachment; filename*=UTF-8''{quoted}"
+    if version_id is not None:
+          headers["X-Proposal-Version"] = str(version_id)
 
     return StreamingResponse(
-        docx_io,
+        BytesIO(doc_bytes.getvalue()),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": content_disposition, "X-Proposal-Version": str(version_id if 'version_id' in locals() else "")}
+        headers=headers
     )
 
-@app.post("/proposal/regenerate")
-async def regenerate(payload: Dict[str, Any] = Body(...)):
+@app.post("/proposal/regenerate", tags=["Proposal Generation"])
+async def regenerate_proposal(version_data: Dict[str, int]):
     """
-    Regenerate endpoint.
-    Accepts either:
-      - {"version_id": 123}  -> fetch payload from DB and regenerate
-      - or full payload same as /api/v1/generate-proposal to regenerate and create a new version
-    Returns the generated docx (and sets X-Proposal-Version header).
+    Regenerates a DOCX file from a previously saved version ID.
     """
-    version_id = payload.get("version_id")
-    if version_id:
-        try:
-            version_id = int(version_id)
-        except Exception:
-            return JSONResponse(status_code=400, content={"detail": "version_id must be an integer"})
-        v = db.get_version(version_id)
-        if not v:
-            return JSONResponse(status_code=404, content={"detail": "version not found"})
-        regen_payload = v["payload"]
-    else:
-        regen_payload = payload
+    if not render_docx_from_template:
+          raise HTTPException(status_code=503, detail="Document engine is not available.")
 
-    # Reuse generation endpoint logic by calling generate_proposal helper path
-    return await generate_proposal(regen_payload)
+    version_id = version_data.get("version_id")
+    if version_id is None:
+        raise HTTPException(status_code=400, detail="version_id is required")
+
+    version_record = db.get_version(version_id)
+    if not version_record:
+        raise HTTPException(status_code=404, detail=f"Version {version_id} not found")
+
+    try:
+        # 1. Load data
+        proposal_payload = json.loads(version_record['payload'])
+        ai_sections = json.loads(version_record['ai_sections'])
+        
+        # 2. Rebuild context
+        context = proposal_payload
+        context.update(ai_sections)
+
+        # === ИСПРАВЛЕНИЕ ТАБЛИЦ: Выравнивание имен ключей ===
+        _prepare_list_data(context)
+        # ==========================================
+        
+        context['current_date'] = _format_date(date.today())
+        context['expected_completion_date'] = _format_date(context.get('deadline'))
+
+        # Re-calculate total investment for regenerated version
+        if context.get("financials"):
+            fin_dict = context["financials"]
+            context.update(fin_dict)
+            context['total_investment_cost'] = _calculate_total_investment(fin_dict)
+        
+        # 3. Render DOCX
+        doc_bytes = render_docx_from_template(
+            template_path=TEMPLATE_PATH,
+            context=context
+        )
+
+        # 4. Return file
+        filename = f"Regen_V{version_id}_{_safe_filename(context.get('client_company_name') or 'proposal')}.docx"
+        encoded_filename = quote(filename)
+
+        return StreamingResponse(
+            BytesIO(doc_bytes.getvalue()),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+                "X-Proposal-Version": str(version_id)
+            }
+        )
+
+    except Exception as e:
+        logger.exception("Regeneration failed for version %s: %s", version_id, e)
+        raise HTTPException(status_code=500, detail=f"Regeneration failed: {e}")
+
+@app.post("/api/v1/suggest", tags=["AI Suggestions"])
+async def suggest_content(proposal: ProposalInput = Body(...)):
+    """
+    Suggests deliverables and phases based on the proposal brief.
+    """
+    if not openai_service:
+         return JSONResponse(status_code=503, content={"detail": "AI suggestion service is not available."})
+    
+    try:
+        suggestions = openai_service.generate_suggestions(proposal.dict()) 
+        return suggestions
+    except Exception as e:
+        logger.exception("Suggestion generation failed: %s", e)
+        return JSONResponse(status_code=500, content={"detail": "Suggestion generation failed."})
+
+# ------------------- Placeholder for Gantt generation -------------------
+def _generate_gantt_bytes(phases: List[Dict[str, Any]]):
+    """
+    Placeholder for Gantt chart generation.
+    """
+    return None
