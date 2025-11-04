@@ -449,6 +449,7 @@ async def regenerate_proposal(body: Dict[str, Any] = Body(...)):
     if doc_engine is None or not hasattr(doc_engine, "render_docx_from_template"):
         raise HTTPException(status_code=503, detail="Document engine is not available on this server.")
     # ...
+    
     version_id = body.get("version_id")
     if version_id:
         # load from DB
