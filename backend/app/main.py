@@ -258,23 +258,19 @@ def _sanitize_ai_text(s: Optional[str], context: Dict[str, Any]) -> str:
 # ----------------- End helpers -----------------
 @app.post("/api/v1/generate-proposal", tags=["Proposal Generation"])
 async def generate_proposal(payload: Dict[str, Any] = Body(...)):
-    """
-    Генерирует коммерческое предложение в формате DOCX, используя данные AI.
-    """
     # ИСПРАВЛЕНО: Проверяем doc_engine и наличие функции
     if doc_engine is None or not hasattr(doc_engine, "render_docx_from_template"):
         raise HTTPException(status_code=503, detail="Document engine is not available on this server.")
-    
+    # ...
     normalized = _normalize_incoming_payload(payload)
 
-    # 1. Валидация входных данных
     try:
         proposal = ProposalInput(**normalized)
     except ValidationError as ve:
         logger.warning("Validation failed for incoming proposal: %s", ve.json())
         return JSONResponse(status_code=422, content={"detail": ve.errors()})
 
-    # 2. Генерация текста AI (АСИНХРОННЫЙ ВЫЗОВ)
+    # AI generation
     ai_sections: Dict[str, Any] = {}
     used_model: Optional[str] = None
     try:
@@ -282,93 +278,136 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
             logger.debug("ai_core not available; skipping AI generation.")
             ai_sections = {}
         else:
-            ai_sections = await ai_core.generate_ai_sections(proposal.dict(), tone=proposal.tone) # Передача tone из модели
-            
-            # Извлечение использованной модели
-            if isinstance(ai_sections, dict):
-                # Проверка _used_model (старый стандарт)
-                used_model = ai_sections.pop("_used_model", None)
-                # Проверка used_model (новый стандарт)
-                if not used_model:
-                    used_model = ai_sections.get("used_model")
-            
+            ai_sections = await ai_core.generate_ai_sections(proposal.dict())
+            if isinstance(ai_sections, dict) and "_used_model" in ai_sections:
+                used_model = ai_sections.pop("_used_model")
+            elif isinstance(ai_sections, dict) and "used_model" in ai_sections:
+                used_model = ai_sections.get("used_model")
     except Exception as e:
         logger.exception("AI generation failed: %s", e)
-        # Fallback (например, к мок-данным, если ai_core не смог)
+        # fallback to safe if ai_core implements fallback
         try:
-            # Если AI Core недоступен/выбросил ошибку, используем мок-данные
-            mock_ai = await _MockAICore().generate_ai_sections()
-            ai_sections = {k: v for k, v in mock_ai.items() if k != 'used_model'}
-            used_model = mock_ai.get('used_model', 'Fallback')
+            ai_sections = await getattr(ai_core, "generate_ai_sections_safe")(proposal.dict())
         except Exception:
             raise HTTPException(status_code=500, detail=f"AI generation failed: {type(e).__name__}: {str(e)}")
 
-    # 3. Подготовка контекста для шаблона DOCX
-    context = proposal.dict() if hasattr(proposal, "dict") else dict(proposal.__dict__)
-    
-    # Обработка алиасов и обеспечение наличия обеих версий ключей (для совместимости шаблонов)
+    # Build context
+    # Build context for doc engine
+    context = proposal.dict() if hasattr(proposal, "dict") else (proposal.model_dump() if hasattr(proposal, "model_dump") else dict(proposal.__dict__))
+    # Ensure alias access (also add alias names to context for template)
+    context["client_company_name"] = context.get("client_name") or context.get("client_company_name","")
+    context["provider_company_name"] = context.get("provider_name") or context.get("provider_company_name","")
+
+    # signature fields: prefer values from original normalized payload if provided
+    context["client_signature_name"] = payload.get("client_signature_name") or context.get("client_signature_name","")
+    context["client_signature_date"] = payload.get("client_signature_date") or context.get("client_signature_date","")
+    context["provider_signature_name"] = payload.get("provider_signature_name") or context.get("provider_signature_name","")
+    context["provider_signature_date"] = payload.get("provider_signature_date") or context.get("provider_signature_date","")
+
+    # keep UI helper dates if provided originally
+    if "proposal_date" in payload:
+        context["proposal_date"] = payload.get("proposal_date")
+    if "valid_until_date" in payload:
+        context["valid_until_date"] = payload.get("valid_until_date")
+    # signatures: ensure keys exist (avoid leaving placeholders un-replaced)
+    # Если пользователь не передал имя/дату подписи — подставляем видимый заполнитель
+
+
+    # даты подписи — оставляем пустыми если не заданы (в формате dd Month YYYY если заданы)
+    context["client_signature_date"] = _format_date(context.get("client_signature_date"))
+    context["provider_signature_date"] = _format_date(context.get("provider_signature_date"))
+
+    # ensure both naming variants exist for templates and sanitization
     client_name_val = context.get("client_company_name") or context.get("client_name") or ""
     provider_name_val = context.get("provider_company_name") or context.get("provider_name") or ""
     context["client_company_name"] = client_name_val
     context["client_name"] = client_name_val
     context["provider_company_name"] = provider_name_val
     context["provider_name"] = provider_name_val
-    
-    # Подстановки для полей подписей (предпочтение исходным данным из payload, если они не были в ProposalInput)
-    context["client_signature_name"] = payload.get("client_signature_name") or context.get("client_signature_name", "")
-    context["client_signature_date"] = payload.get("client_signature_date") or context.get("client_signature_date", "")
-    context["provider_signature_name"] = payload.get("provider_signature_name") or context.get("provider_signature_name", "")
-    context["provider_signature_date"] = payload.get("provider_signature_date") or context.get("provider_signature_date", "")
-    
-    # Очистка текста AI (санитайзинг)
+
+    # sanitize AI text (replace placeholders embedded in LLM output)
     if isinstance(ai_sections, dict):
         for k, v in list(ai_sections.items()):
             ai_sections[k] = _sanitize_ai_text(v, context)
-    
-    # Объединение разделов AI с контекстом
+
+    # merge AI sections into context (AI text now sanitized)
     if isinstance(ai_sections, dict):
         context.update(ai_sections)
-        
-    # Преобразование списков для движка DOCX
+
+    # convert lists & keys for doc engine
     _prepare_list_data(context)
 
-    # Вычисляемые и форматированные поля
+    # computed/flattened fields
     context["current_date"] = _format_date(date.today())
     context["expected_completion_date"] = _format_date(context.get("deadline"))
-    context["proposal_date"] = _format_date(context.get("proposal_date")) # Из модели
-    context["valid_until_date"] = _format_date(context.get("valid_until_date")) # Из модели
+    context["proposal_date"] = _format_date(context.get("proposal_date"))
+    context["valid_until_date"] = _format_date(context.get("valid_until_date"))
 
-    # Обработка финансовых данных
+    # signatures: ensure keys exist (avoid leaving placeholders un-replaced)
+    context["client_signature_name"] = context.get("client_signature_name") or ""
+    context["provider_signature_name"] = context.get("provider_signature_name") or ""
+    context["client_signature_date"] = _format_date(context.get("client_signature_date"))
+    context["provider_signature_date"] = _format_date(context.get("provider_signature_date"))
+
+    # financials flatten / totals
     if context.get("financials") and isinstance(context["financials"], dict):
         fin = context["financials"]
-        # Обеспечиваем плоские ключи для шаблона
         context["development_cost"] = fin.get("development_cost")
         context["licenses_cost"] = fin.get("licenses_cost")
         context["support_cost"] = fin.get("support_cost")
         context["total_investment_cost"] = _calculate_total_investment(fin)
 
-    # Финальная обработка полей подписей
+    logger.debug("Rendering context keys: %s", sorted(list(context.keys())))
+    # Render DOCX
+    def _format_signature_date(val):
+        if val is None or val == "":
+            return ""
+        # if already a date-like iso string, try parse and pretty-format
+        try:
+            if isinstance(val, str):
+                # try ISO parse
+                try:
+                    dt = date.fromisoformat(val)
+                    # readable: 31 October 2025 (you can adapt to locale if needed)
+                    return dt.strftime("%d %B %Y")
+                except Exception:
+                    return val
+            if isinstance(val, date):
+                return val.strftime("%d %B %Y")
+        except Exception:
+            pass
+        return str(val)
+
+    # Default visible line for missing name (so placeholder doesn't disappear visually)
     _default_sig_line = "_________________________"
 
-    # Обеспечиваем видимый заполнитель имени, если оно отсутствует
-    context["client_signature_name"] = context.get("client_signature_name") or client_name_val or _default_sig_line
-    context["provider_signature_name"] = context.get("provider_signature_name") or provider_name_val or _default_sig_line
+    # Ensure keys exist — take from context if present, otherwise safe fallback
+    context["client_signature_name"] = context.get("client_signature_name") or context.get("client_name") or context.get("client_company_name") or _default_sig_line
+    context["provider_signature_name"] = context.get("provider_signature_name") or context.get("provider_name") or context.get("provider_company_name") or _default_sig_line
 
-    # Форматируем даты подписей (пустая строка, если отсутствует)
-    context["client_signature_date"] = _format_date(context.get("client_signature_date"))
-    context["provider_signature_date"] = _format_date(context.get("provider_signature_date"))
-    
-    logger.debug("Rendering context keys: %s", sorted(list(context.keys())))
+    # Format signature dates (empty string if missing)
+    context["client_signature_date"] = _format_signature_date(context.get("client_signature_date") or context.get("client_signature_date_iso") or "")
+    context["provider_signature_date"] = _format_signature_date(context.get("provider_signature_date") or context.get("provider_signature_date_iso") or "")
 
-    # 4. Рендеринг DOCX
+    # Now render_docx_from_template(...) can safely replace {{client_signature_name}} etc.
+
     try:
-        # doc_engine уже проверен в начале
-        doc_out = doc_engine.render_docx_from_template(TEMPLATE_PATH, context)
+        # УПРОЩЕНО: Убираем дублирующуюся проверку, оставляем вызов через doc_engine
+        if doc_engine and hasattr(doc_engine, "render_docx_from_template"):
+            doc_out = doc_engine.render_docx_from_template(TEMPLATE_PATH, context)
+        else:
+            # Этот блок нужен только если doc_engine != None, но функция в нем отсутствует
+            # (но мы уже проверили doc_engine is None в начале)
+            raise HTTPException(status_code=503, detail="Document engine is not available or badly configured.")
+
+    except HTTPException:
+        # re-raise 503 from inner check
+        raise
     except Exception as e:
         logger.exception("DOCX rendering failed: %s", e)
         raise HTTPException(status_code=500, detail=f"DOCX rendering failed: {type(e).__name__}: {str(e)}")
 
-    # 5. Получение байтов и обработка возвращаемого типа
+    # get bytes
     try:
         if isinstance(doc_out, BytesIO):
             doc_bytes = doc_out.getvalue()
@@ -377,33 +416,27 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
         elif isinstance(doc_out, (bytes, bytearray)):
             doc_bytes = bytes(doc_out)
         else:
+            # Added more explicit error handling for unexpected return type
             logger.error("DOCX generation returned unexpected type: %s", type(doc_out))
             raise TypeError("DOCX generation returned unexpected type")
     except Exception as e:
         logger.exception("Failed to extract bytes from doc engine output: %s", e)
         raise HTTPException(status_code=500, detail="DOCX generation returned unexpected type")
 
-    # 6. Сохранение версии в БД (опционально)
+    # Save version
     version_id = None
     try:
-        # Используем proposal.dict() для чистого payload, ai_sections для AI-данных, used_model для модели LLM
         version_id = db.save_version(payload=proposal.dict(), ai_sections=ai_sections or {}, used_model=used_model)
     except Exception:
         logger.exception("Failed to save proposal version (non-fatal)")
 
-    # 7. Возврат файла
-    # Используем _safe_filename для создания имени файла
     filename = f"{_safe_filename(context.get('client_company_name') or '')}_{_safe_filename(context.get('project_goal') or '')}.docx"
     encoded = quote(filename)
     headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{encoded}"}
     if version_id:
         headers["X-Proposal-Version"] = str(version_id)
 
-    return StreamingResponse(
-        BytesIO(doc_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers=headers
-    )
+    return StreamingResponse(BytesIO(doc_bytes), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers=headers)
 
 
 
@@ -645,6 +678,31 @@ def suggest(payload: Dict[str, Any] = Body(...)):
     except Exception as e:
         logger.exception("Suggestion generation failed: %s", e)
         return JSONResponse(status_code=500, content={"detail": "Suggestion generation failed."})
+
+@app.get("/api/v1/version/{version_id}")
+def get_version(version_id: int):
+    if "db" not in globals() or db is None:
+        raise HTTPException(status_code=500, detail="Database service is not available")
+    try:
+        row = db.get_version(version_id)
+    except Exception as e:
+        logger.exception("DB read failed for version %s: %s", version_id, e)
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve proposal version {version_id}")
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Proposal version {version_id} not found")
+    # Expect row to contain payload and ai_sections; try robust parse
+    try:
+        payload_data = row.get("payload") if isinstance(row, dict) else None
+        if isinstance(payload_data, str):
+            payload_data = json.loads(payload_data)
+        elif payload_data is None and isinstance(row, dict):
+            # maybe flattened columns
+            payload_data = {k: row.get(k) for k in row.keys()}
+    except Exception as e:
+        logger.exception("Failed parsing DB payload for version %s: %s", version_id, e)
+        raise HTTPException(status_code=500, detail="Failed to parse payload from database")
+    return {"version_id": version_id, "payload": payload_data, "ai_sections": row.get("ai_sections", {})}
+
 
 # --- Инициализация БД (если доступна) ---
 try:
