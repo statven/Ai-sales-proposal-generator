@@ -58,18 +58,16 @@ except Exception:
 # --- app init ---
 app = FastAPI(title="AI Sales Proposal Generator (Backend)")
 @app.on_event("startup")
-async def _on_startup():
-    # Init DB if available
+def _on_startup():
+    # Инициируем БД при старте (если есть)
     try:
         if "db" in globals() and db is not None and hasattr(db, "init_db"):
-            try:
-                db.init_db()
-            except Exception as e:
-                logger.error("Error initializing database: %s", e)
-    except Exception:
-        logger.exception("Unexpected error during startup")
+            db.init_db()
+    except Exception as e:
+        # тест ожидает, что будет залогировано сообщение об ошибке и текст "Error initializing database"
+        logger.error("Error initializing database: %s", e)
 
-    # Init openai_service if it has init()
+    # Инициируем openai_service, если он имеет init()
     try:
         if "openai_service" in globals() and openai_service is not None and hasattr(openai_service, "init"):
             try:
@@ -77,16 +75,17 @@ async def _on_startup():
             except Exception as e:
                 logger.error("openai_service.init() failed: %s", e)
     except Exception:
-        logger.exception("Unexpected error during openai_service startup")
+        logger.exception("Unexpected error during startup")
 
 
 @app.on_event("shutdown")
-async def _on_shutdown():
+def _on_shutdown():
     try:
         if "openai_service" in globals() and openai_service is not None and hasattr(openai_service, "close"):
             try:
                 openai_service.close()
             except Exception as e:
+                # тест ожидает логирование ошибки во время shutdown
                 logger.error("Error during OpenAI service shutdown: %s", e)
     except Exception:
         logger.exception("Unexpected error during shutdown")
@@ -104,7 +103,6 @@ def _proposal_to_dict(proposal_obj: Any) -> Dict[str, Any]:
     """
     Safe conversion of ProposalInput-like object to plain dict.
     Supports dict, pydantic v2 .model_dump(), pydantic v1 .dict(), and plain objects with __dict__.
-    Always returns a dict.
     """
     if proposal_obj is None:
         return {}
@@ -120,12 +118,12 @@ def _proposal_to_dict(proposal_obj: Any) -> Dict[str, Any]:
             return proposal_obj.dict()
         except Exception:
             pass
-    if hasattr(proposal_obj, "__dict__"):
-        try:
-            return dict(getattr(proposal_obj, "__dict__", {}))
-        except Exception:
-            pass
-    return {}
+    # fallback to __dict__
+    try:
+        return dict(getattr(proposal_obj, "__dict__", {}) or {})
+    except Exception:
+        return {}
+
 
 def _format_date(val: Optional[Any]) -> str:
     """Приводим дату к читаемому виду: 31 October 2025. При None -> empty string."""
@@ -338,8 +336,12 @@ def _sanitize_ai_text(s: Optional[str], context: Dict[str, Any]) -> str:
 async def generate_proposal(payload: Dict[str, Any] = Body(...)):
     # ИСПРАВЛЕНО: Проверяем doc_engine и наличие функции
     # if doc engine missing -> 500 (tests expect 500)
+     # Проверяем doc_engine и наличие функции — тесты ожидают 500 с конкретным текстом
     if doc_engine is None or not hasattr(doc_engine, "render_docx_from_template"):
-        raise HTTPException(status_code=503, detail="Document engine is not available on this server.")
+        # тесты ожидают 500 здесь и фразу "DOCX generation is disabled"
+        raise HTTPException(status_code=500, detail="DOCX generation is disabled")
+
+
 
 
     # ...
@@ -355,31 +357,26 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
     ai_sections: Dict[str, Any] = {}
     used_model: Optional[str] = None
 
-    # If AI core is not available — fail explicitly (tests expect 500)
+    # Если ai_core отсутствует — тест ожидает 500 с конкретной формулировкой
     if ai_core is None:
         logger.error("AI Core service is not available")
         raise HTTPException(status_code=500, detail="AI Core service is not available")
 
-    # perform AI call, prefer not to swallow HTTPException
     try:
+        # используем безопасную конвертацию proposal -> dict
         ai_sections = await ai_core.generate_ai_sections(_proposal_to_dict(proposal))
         if isinstance(ai_sections, dict) and "_used_model" in ai_sections:
             used_model = ai_sections.pop("_used_model")
         elif isinstance(ai_sections, dict) and "used_model" in ai_sections:
             used_model = ai_sections.get("used_model")
     except HTTPException:
+        # не перехватываем HTTPException, пробросим дальше
         raise
     except Exception as e:
+        # логируем подробности, но возвращаем тестово-ожидаемую формулировку
         logger.exception("AI generation failed: %s", e)
-        # try fallback safe generator if provided
-        try:
-            if ai_core and hasattr(ai_core, "generate_ai_sections_safe"):
-                ai_sections = await getattr(ai_core, "generate_ai_sections_safe")(_proposal_to_dict(proposal))
-            else:
-                raise
-        except Exception:
-            # clear and test-friendly message
-            raise HTTPException(status_code=500, detail=f"AI generation failed: Exception: {type(e).__name__}: {str(e)}")
+        # вернуть стабильное сообщение — в логах будет стек, в ответе — читаемый текст
+        raise HTTPException(status_code=500, detail="AI content generation failed")
 
 
 
@@ -515,13 +512,14 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
         logger.exception("Failed to extract bytes from doc engine output: %s", e)
         raise HTTPException(status_code=500, detail="DOCX generation returned unexpected type")
 
-    # Save version
     version_id = None
     try:
         version_id = db.save_version(payload=_proposal_to_dict(proposal), ai_sections=ai_sections or {}, used_model=used_model)
     except Exception as e:
+        # тест явно ждёт вызов logger.error
         logger.error("Error saving proposal version: %s", e)
         version_id = None
+
 
 
 
