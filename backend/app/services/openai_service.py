@@ -344,11 +344,11 @@ def generate_ai_json(proposal: Dict[str, Any], tone: str = "Formal") -> str:
             res = _call_openai_new_client(prompt_str, OPENAI_MODEL)
             if res:
                 # try to update cache
-                try:
-                    _invoke_openai_cached.cache_clear() # crude invalidation
-                    _invoke_openai_cached(prompt_str, OPENAI_MODEL) # re-populate
-                except Exception:
-                    pass
+                #try:
+                   # _invoke_openai_cached.cache_clear() # crude invalidation
+                  #  _invoke_openai_cached(prompt_str, OPENAI_MODEL) # re-populate
+                #except Exception:
+                   # pass
                 return res
             last_reason = "openai_empty"
             logger.warning("OpenAI returned empty on attempt %d", attempt)
@@ -491,11 +491,12 @@ def generate_suggestions(proposal: Dict[str, Any], tone: str = "Formal", max_del
     for attempt in range(1, OPENAI_RETRY_ATTEMPTS + 1):
         try:
             # prefer new client call if available
-            try:
-                txt = _call_openai_new_client(prompt, OPENAI_MODEL)
-            except Exception:
+             #try:
+                #txt = _call_openai_new_client(prompt, OPENAI_MODEL)
+             #except Exception:
                 # If new client not available, fall back to _invoke_openai_cached (which may call new client)
-                txt = _invoke_openai_cached(prompt, OPENAI_MODEL)
+            # prefer new client call if available
+            txt = _call_openai_new_client(prompt, OPENAI_MODEL)
             
             if not txt:
                 last_exc = RuntimeError("empty response")

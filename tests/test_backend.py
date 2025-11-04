@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from unittest.mock import MagicMock, patch
 
 from backend.app.models import ProposalInput
-# Подключаем main.app
+
 from backend.app.main import app
 
 client = TestClient(app)

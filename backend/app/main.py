@@ -289,7 +289,7 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
         try:
             ai_sections = await getattr(ai_core, "generate_ai_sections_safe")(proposal.dict())
         except Exception:
-            raise HTTPException(status_code=500, detail=f"AI generation failed: {type(e).__name__}")
+            raise HTTPException(status_code=500, detail=f"AI generation failed: {type(e).__name__}: {str(e)}")
 
     # Build context
     # Build context for doc engine
@@ -405,7 +405,7 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
         raise
     except Exception as e:
         logger.exception("DOCX rendering failed: %s", e)
-        raise HTTPException(status_code=500, detail=f"DOCX rendering failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"DOCX rendering failed: {type(e).__name__}: {str(e)}")
 
     # get bytes
     try:
@@ -580,7 +580,69 @@ async def regenerate_proposal(body: Dict[str, Any] = Body(...)):
 
     return StreamingResponse(BytesIO(doc_bytes), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers=headers)
 
-    
+    # Вставить после @app.post("/api/v1/generate-proposal", ...)
+
+@app.get("/api/v1/versions", tags=["Version Control"])
+def get_all_versions():
+    """Возвращает список всех сохраненных версий (для истории)."""
+    try:
+        versions = db.get_all_versions()
+        return JSONResponse(status_code=200, content=versions)
+    except Exception as e:
+        logger.exception("get_all_versions failed: %s", e)
+        raise HTTPException(status_code=500, detail="Database read failed")
+
+@app.get("/api/v1/versions/{version_id}", tags=["Version Control"])
+def get_version(version_id: int):
+    """Возвращает полную сохраненную версию по ID."""
+    try:
+        rec = db.get_version(version_id)
+        if not rec:
+            raise HTTPException(status_code=404, detail="Version not found")
+        return JSONResponse(status_code=200, content=rec)
+    except HTTPException:
+        raise  # re-raise 404
+    except Exception as e:
+        logger.exception("get_version failed: %s", e)
+        raise HTTPException(status_code=500, detail="Database read failed")
+
+@app.get("/api/v1/versions/{version_id}/data", tags=["Version Control"])
+def get_version_data(version_id: int):
+    """Возвращает только payload (сырые входные данные) для регенерации/редактирования."""
+    try:
+        rec = db.get_version(version_id)
+        if not rec:
+            raise HTTPException(status_code=404, detail="Version not found")
+        # Логика извлечения payload, если он хранится как строка (JSON)
+        payload = rec.get("payload")
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        
+        return JSONResponse(status_code=200, content=payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("get_version_data failed: %s", e)
+        raise HTTPException(status_code=500, detail="Database read failed")
+
+@app.get("/api/v1/versions/{version_id}/sections", tags=["Version Control"])
+def get_version_ai_sections(version_id: int):
+    """Возвращает только AI-сгенерированные секции."""
+    try:
+        rec = db.get_version(version_id)
+        if not rec:
+            raise HTTPException(status_code=404, detail="Version not found")
+        # Логика извлечения AI-секций, если они хранятся как строка (JSON)
+        ai_sections = rec.get("ai_sections")
+        if isinstance(ai_sections, str):
+            ai_sections = json.loads(ai_sections)
+        
+        return JSONResponse(status_code=200, content=ai_sections or {})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("get_version_ai_sections failed: %s", e)
+        raise HTTPException(status_code=500, detail="Database read failed")
 @app.post("/api/v1/suggest", tags=["AI Suggestions"])
 async def suggest_content(payload: Dict[str, Any] = Body(...)):
     """
