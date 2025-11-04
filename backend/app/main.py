@@ -57,13 +57,75 @@ except Exception:
 
 # --- app init ---
 app = FastAPI(title="AI Sales Proposal Generator (Backend)")
+@app.on_event("startup")
+async def _on_startup():
+    # Init DB if available
+    try:
+        if "db" in globals() and db is not None and hasattr(db, "init_db"):
+            try:
+                db.init_db()
+            except Exception as e:
+                logger.error("Error initializing database: %s", e)
+    except Exception:
+        logger.exception("Unexpected error during startup")
+
+    # Init openai_service if it has init()
+    try:
+        if "openai_service" in globals() and openai_service is not None and hasattr(openai_service, "init"):
+            try:
+                openai_service.init()
+            except Exception as e:
+                logger.error("openai_service.init() failed: %s", e)
+    except Exception:
+        logger.exception("Unexpected error during openai_service startup")
+
+
+@app.on_event("shutdown")
+async def _on_shutdown():
+    try:
+        if "openai_service" in globals() and openai_service is not None and hasattr(openai_service, "close"):
+            try:
+                openai_service.close()
+            except Exception as e:
+                logger.error("Error during OpenAI service shutdown: %s", e)
+    except Exception:
+        logger.exception("Unexpected error during shutdown")
 
 TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", os.path.join(os.getcwd(), "docs", "template.docx"))
 if not os.path.exists(TEMPLATE_PATH):
     logger.warning("Template not found at %s. Ensure template.docx is present.", TEMPLATE_PATH)
 
 
+
 # ----------------- Helpers -----------------
+from typing import Any  # если ещё не импортировано
+
+def _proposal_to_dict(proposal_obj: Any) -> Dict[str, Any]:
+    """
+    Safe conversion of ProposalInput-like object to plain dict.
+    Supports dict, pydantic v2 .model_dump(), pydantic v1 .dict(), and plain objects with __dict__.
+    Always returns a dict.
+    """
+    if proposal_obj is None:
+        return {}
+    if isinstance(proposal_obj, dict):
+        return dict(proposal_obj)
+    if hasattr(proposal_obj, "model_dump"):
+        try:
+            return proposal_obj.model_dump()
+        except Exception:
+            pass
+    if hasattr(proposal_obj, "dict"):
+        try:
+            return proposal_obj.dict()
+        except Exception:
+            pass
+    if hasattr(proposal_obj, "__dict__"):
+        try:
+            return dict(getattr(proposal_obj, "__dict__", {}))
+        except Exception:
+            pass
+    return {}
 
 def _format_date(val: Optional[Any]) -> str:
     """Приводим дату к читаемому виду: 31 October 2025. При None -> empty string."""
@@ -158,59 +220,79 @@ def _prepare_list_data(context: Dict[str, Any]) -> None:
 def _normalize_incoming_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
     p = dict(raw) if isinstance(raw, dict) else {}
 
-    # aliases
-    if "client_company_name" not in p:
-        p["client_company_name"] = p.get("client_name", "") or p.get("client_company_name", "") or ""
-    if "provider_company_name" not in p:
-        p["provider_company_name"] = p.get("provider_name", "") or p.get("provider_company_name", "") or ""
+    # aliases with sane defaults
+    p["client_company_name"] = (p.get("client_company_name") or p.get("client_name") or "").strip()
+    if not p["client_company_name"]:
+        p["client_company_name"] = "Client"
+
+    p["provider_company_name"] = (p.get("provider_company_name") or p.get("provider_name") or "").strip()
+    if not p["provider_company_name"]:
+        p["provider_company_name"] = "Provider"
+
     # scope alias
     if "scope_description" not in p and "scope" in p:
         p["scope_description"] = p["scope"]
     if "scope" not in p and "scope_description" in p:
         p["scope"] = p["scope_description"]
 
-    # tone safe default
-    p["tone"] = p.get("tone") or "Formal"
+    # tone safe default / mapping
+    t = p.get("tone") or "Formal"
+    mapping = {
+        "Формальный": "Formal", "Маркетинг": "Marketing",
+        "Маркетирование": "Marketing", "Technical": "Technical",
+        "Технический": "Technical", "Friendly": "Friendly",
+        "Дружелюбный": "Friendly",
+    }
+    p["tone"] = mapping.get(str(t).strip(), str(t).strip() if str(t).strip() in ("Formal", "Marketing", "Technical", "Friendly") else "Formal")
 
-    # deliverables: allow list of strings -> list of dicts
-    d = p.get("deliverables", [])
-    if isinstance(d, list):
-        if all(isinstance(x, str) for x in d):
-            p["deliverables"] = [{"title": x, "description": x, "acceptance_criteria": ""} for x in d]
-        else:
-            # ensure dict form for each element
-            p["deliverables"] = [x if isinstance(x, dict) else {"title": str(x), "description": str(x), "acceptance_criteria": ""} for x in d]
+    # deliverables: accept list[str] or list[dict]
+    delivers = p.get("deliverables", [])
+    new_del = []
+    if isinstance(delivers, list):
+        for d in delivers:
+            if isinstance(d, dict):
+                title = str(d.get("title", "") or d.get("name", "")).strip() or "Deliverable"
+                desc = str(d.get("description", "") or d.get("detail", "")).strip()
+                if len(desc) < 10:
+                    desc = f"Deliverable: {title}"
+                acc = str(d.get("acceptance_criteria", "") or d.get("acceptance", "")).strip() or "To be accepted"
+                new_del.append({"title": title, "description": desc, "acceptance_criteria": acc})
+            else:
+                s = str(d)
+                title = s or "Deliverable"
+                desc = f"Deliverable: {s}" if len(s) < 10 else s
+                new_del.append({"title": title, "description": desc, "acceptance_criteria": "To be accepted"})
+    p["deliverables"] = new_del
 
-    # phases: allow list of strings -> list of dicts
-    ph = p.get("phases", [])
-    if isinstance(ph, list):
-        if all(isinstance(x, str) for x in ph):
-            p["phases"] = [{"phase_name": x, "duration_weeks": 1, "tasks": ""} for x in ph]
-        else:
-            # coerce items to dicts and normalize duration
-            normph = []
-            for item in ph:
-                if isinstance(item, dict):
-                    duration = item.get("duration_weeks") or item.get("duration") or 1
-                    try:
-                        duration = int(duration)
-                    except Exception:
-                        duration = 1
-                    normph.append({"phase_name": item.get("phase_name") or item.get("name") or "", "duration_weeks": duration, "tasks": item.get("tasks", "")})
-                else:
-                    normph.append({"phase_name": str(item), "duration_weeks": 1, "tasks": ""})
-            p["phases"] = normph
+    # phases: accept list[str] or list[dict]
+    phases = p.get("phases", [])
+    new_ph = []
+    if isinstance(phases, list):
+        for ph in phases:
+            if isinstance(ph, dict):
+                name = str(ph.get("phase_name") or ph.get("name") or "").strip() or "Phase"
+                try:
+                    weeks = int(ph.get("duration_weeks") or ph.get("duration") or 1)
+                except Exception:
+                    weeks = 1
+                tasks = str(ph.get("tasks") or ph.get("description") or "").strip() or "TBD"
+                if len(tasks) < 3:
+                    tasks = "TBD"
+                new_ph.append({"phase_name": name, "duration_weeks": weeks, "tasks": tasks})
+            else:
+                name = str(ph) or "Phase"
+                new_ph.append({"phase_name": name, "duration_weeks": 1, "tasks": "TBD"})
+    p["phases"] = new_ph
 
-    # financials: if None but financials_details provided -> use that
+    # financials fallback
     if not p.get("financials") and p.get("financials_details"):
         p["financials"] = p.get("financials_details")
     p["financials"] = p.get("financials") or {}
 
-    # deadline: try parse, if invalid set to today
+    # deadline: if invalid -> today
     dl = p.get("deadline")
     try:
         if dl:
-            # will raise if invalid
             _ = date.fromisoformat(str(dl))
         else:
             p["deadline"] = date.today().isoformat()
@@ -257,7 +339,8 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
     # ИСПРАВЛЕНО: Проверяем doc_engine и наличие функции
     # if doc engine missing -> 500 (tests expect 500)
     if doc_engine is None or not hasattr(doc_engine, "render_docx_from_template"):
-      raise HTTPException(status_code=500, detail="DOCX generation is disabled")
+        raise HTTPException(status_code=503, detail="Document engine is not available on this server.")
+
 
     # ...
     normalized = _normalize_incoming_payload(payload)
@@ -271,32 +354,38 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
     # AI generation
     ai_sections: Dict[str, Any] = {}
     used_model: Optional[str] = None
+
+    # If AI core is not available — fail explicitly (tests expect 500)
+    if ai_core is None:
+        logger.error("AI Core service is not available")
+        raise HTTPException(status_code=500, detail="AI Core service is not available")
+
+    # perform AI call, prefer not to swallow HTTPException
     try:
-        if ai_core is None:
-            logger.error("AI Core service is not available")
-            raise HTTPException(status_code=500, detail="AI Core service is not available")
-        else:
-            ai_sections = await ai_core.generate_ai_sections(proposal.dict())
-            if isinstance(ai_sections, dict) and "_used_model" in ai_sections:
-                used_model = ai_sections.pop("_used_model")
-            elif isinstance(ai_sections, dict) and "used_model" in ai_sections:
-                used_model = ai_sections.get("used_model")
+        ai_sections = await ai_core.generate_ai_sections(_proposal_to_dict(proposal))
+        if isinstance(ai_sections, dict) and "_used_model" in ai_sections:
+            used_model = ai_sections.pop("_used_model")
+        elif isinstance(ai_sections, dict) and "used_model" in ai_sections:
+            used_model = ai_sections.get("used_model")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("AI generation failed: %s", e)
-        # try fallback generate_ai_sections_safe if available
+        # try fallback safe generator if provided
         try:
             if ai_core and hasattr(ai_core, "generate_ai_sections_safe"):
-                ai_sections = await ai_core.generate_ai_sections_safe(_proposal_to_dict(proposal))
+                ai_sections = await getattr(ai_core, "generate_ai_sections_safe")(_proposal_to_dict(proposal))
             else:
                 raise
         except Exception:
-            # return a test-friendly message expected by unit tests
-            raise HTTPException(status_code=500, detail="AI content generation failed")
+            # clear and test-friendly message
+            raise HTTPException(status_code=500, detail=f"AI generation failed: Exception: {type(e).__name__}: {str(e)}")
+
 
 
     # Build context
     # Build context for doc engine
-    context = proposal.dict() if hasattr(proposal, "dict") else (proposal.model_dump() if hasattr(proposal, "model_dump") else dict(proposal.__dict__))
+    context = _proposal_to_dict(proposal)
     # Ensure alias access (also add alias names to context for template)
     context["client_company_name"] = context.get("client_name") or context.get("client_company_name","")
     context["provider_company_name"] = context.get("provider_name") or context.get("provider_company_name","")
@@ -431,8 +520,9 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
     try:
         version_id = db.save_version(payload=_proposal_to_dict(proposal), ai_sections=ai_sections or {}, used_model=used_model)
     except Exception as e:
-        # must log error (test asserts logger.error called)
         logger.error("Error saving proposal version: %s", e)
+        version_id = None
+
 
 
     filename = f"{_safe_filename(context.get('client_company_name') or '')}_{_safe_filename(context.get('project_goal') or '')}.docx"
@@ -711,39 +801,6 @@ def get_version(version_id: int):
 
 
 # --- Инициализация БД (если доступна) ---
-# --- Startup / Shutdown handlers ---
-@app.on_event("startup")
-async def _on_startup():
-    # Инициализация БД безопасно (тесты ожидают вызов init_db при создании TestClient)
-    try:
-        if "db" in globals() and db is not None and hasattr(db, "init_db"):
-            db.init_db()
-    except Exception as e:
-        logger.exception("Error initializing database on startup: %s", e)
-
-    # Try to init openai_service if it has init()
-    try:
-        if "openai_service" in globals() and openai_service is not None and hasattr(openai_service, "init"):
-            try:
-                openai_service.init()
-            except Exception as e:
-                logger.exception("openai_service.init() failed: %s", e)
-    except Exception:
-        # swallow outer exceptions to not break startup
-        logger.exception("Unexpected error during openai_service startup.")
-
-@app.on_event("shutdown")
-async def _on_shutdown():
-    # Закрываем external services if they provide close()
-    try:
-        if "openai_service" in globals() and openai_service is not None and hasattr(openai_service, "close"):
-            try:
-                openai_service.close()
-            except Exception as e:
-                logger.error("Error during OpenAI service shutdown: %s", e)
-    except Exception:
-        logger.exception("Unexpected error during shutdown.")
-
 
 @app.get("/api/v1/health")
 def health():
