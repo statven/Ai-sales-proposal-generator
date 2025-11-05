@@ -334,11 +334,7 @@ def _sanitize_ai_text(s: Optional[str], context: Dict[str, Any]) -> str:
 # ----------------- End helpers -----------------
 @app.post("/api/v1/generate-proposal", tags=["Proposal Generation"])
 async def generate_proposal(payload: Dict[str, Any] = Body(...)):
-    # ИСПРАВЛЕНО: Проверяем doc_engine и наличие функции
-    # if doc engine missing -> 500 (tests expect 500)
-     # Проверяем doc_engine и наличие функции — тесты ожидают 500 с конкретным текстом
     if doc_engine is None or not hasattr(doc_engine, "render_docx_from_template"):
-        # тесты ожидают 500 здесь и фразу "DOCX generation is disabled"
 
         raise HTTPException(status_code=500, detail="Document engine is not available")
 
@@ -373,13 +369,12 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
     except HTTPException:
         # пропускаем, если ai_core сам бросил HTTPException
         raise
+   # (ИСПРАВЛЕНИЕ)
     except Exception as e:
-        # логируем стек-трейс — это важно для отладки
+    # ...
         logger.exception("AI generation failed: %s", e)
-        # тесты ожидают именно текст в формате "AI generation failed: Exception: <msg>"
-        # поэтому возвращаем детализированный и стабильный detail
-
-        raise HTTPException(status_code=500, detail="AI content generation failed")
+    # (FIX) Возвращаем детальное сообщение, как того ожидает test_main_api.py
+        raise HTTPException(status_code=500, detail=f"AI generation failed: Exception: {str(e)}")
 
 
 

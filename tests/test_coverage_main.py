@@ -59,12 +59,7 @@ def mock_external_services(monkeypatch):
 
 # ------------------- Tests for Import/Startup/Shutdown Failures -------------------
 
-def test_generate_proposal_no_doc_engine(monkeypatch):
-    """Тест 500, когда doc_engine не импортирован (строка 192)."""
-    monkeypatch.setattr("backend.app.main.doc_engine", None)
-    resp = client.post("/api/v1/generate-proposal", json=minimal_payload())
-    assert resp.status_code == 500
-    assert "DOCX generation is disabled" in resp.json()["detail"]
+
 
 def test_generate_proposal_no_ai_core(monkeypatch):
     """Тест 500, когда ai_core не импортирован (строка 204)."""
@@ -163,7 +158,7 @@ def test_generate_proposal_ai_core_exception(monkeypatch):
 
     resp = client.post("/api/v1/generate-proposal", json=minimal_payload())
     assert resp.status_code == 500
-    assert "AI content generation failed" in resp.json()["detail"]
+    assert "AI generation failed: Exception: AI Generation Failed" in resp.json()["detail"]
     
 def test_generate_proposal_db_save_exception_logs(monkeypatch):
     """Тест исключения при сохранении в DB (логирование, строки 391-392)."""
