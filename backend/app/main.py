@@ -11,6 +11,9 @@ from datetime import datetime, date
 from io import BytesIO
 from urllib.parse import quote
 import asyncio
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from fastapi.responses import Response
+from backend.app import observability
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -57,6 +60,23 @@ except Exception:
 
 # --- app init ---
 app = FastAPI(title="AI Sales Proposal Generator (Backend)")
+# Инициализация observability
+try:
+    observability.setup_logging()
+    # register simple prometheus endpoint
+    @app.get("/metrics")
+    def _metrics():
+        data = generate_latest()
+        return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+    # add ASGI middleware for metrics
+    app.add_middleware_type = getattr(app, "add_middleware", None)
+    # attach middleware manually (works for FastAPI/Starlette)
+    app.middleware("http")(observability.metrics_middleware(app))
+except Exception:
+    # не ломаем приложение если observability не установлена/ошибка
+    import logging
+    logging.getLogger(__name__).warning("Observability init failed", exc_info=True)
+
 @app.on_event("startup")
 def _on_startup():
     # Инициируем БД при старте (если есть)
@@ -76,10 +96,24 @@ def _on_startup():
                 logger.error("openai_service.init() failed: %s", e)
     except Exception:
         logger.exception("Unexpected error during startup")
+    sentry = os.environ.get("SENTRY_DSN")
+    if sentry:
+            try:
+                # Не импортируем sentry_sdk по-умолчанию — импортируйте только если он установлен.
+                import sentry_sdk
+                from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
+
+                sentry_sdk.init(dsn=sentry)
+                # Если вы используете FastAPI app прямо в этом модуле, обернуть app в middleware можно в on_startup.
+                logger.info("SENTRY_DSN configured (not printed).")
+            except Exception as exc:
+                # Не прерываем запуск приложения, но логируем причину
+                logger.warning("Failed to initialize Sentry SDK: %s", exc)
 
 
 @app.on_event("shutdown")
 def _on_shutdown():
+    
     try:
         if "openai_service" in globals() and openai_service is not None and hasattr(openai_service, "close"):
             try:
@@ -89,6 +123,19 @@ def _on_shutdown():
                 logger.error("Error during OpenAI service shutdown: %s", e)
     except Exception:
         logger.exception("Unexpected error during shutdown")
+    sentry = os.environ.get("SENTRY_DSN")
+    if sentry:
+        try:
+            # Не импортируем sentry_sdk по-умолчанию — импортируйте только если он установлен.
+            import sentry_sdk
+            from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
+
+            sentry_sdk.init(dsn=sentry)
+            # Если вы используете FastAPI app прямо в этом модуле, обернуть app в middleware можно в on_startup.
+            logger.info("SENTRY_DSN configured (not printed).")
+        except Exception as exc:
+            # Не прерываем запуск приложения, но логируем причину
+            logger.warning("Failed to initialize Sentry SDK: %s", exc)
 
 TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", os.path.join(os.getcwd(), "docs", "template.docx"))
 if not os.path.exists(TEMPLATE_PATH):
