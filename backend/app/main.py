@@ -801,4 +801,3 @@ def get_version(version_id: int):
 @app.get("/api/v1/health")
 def health():
     return {"status": "ok"}
-
