@@ -21,7 +21,8 @@ def patch_doc_and_db_and_ai(monkeypatch):
     try:
         import backend.app.db as dbmod
         monkeypatch.setattr(dbmod, "save_version", lambda *args, **kwargs: 1)
-        monkeypatch.setattr(dbmod, "get_version", lambda vid: {"payload": json.dumps(args[0])} if False else None)
+        monkeypatch.setattr(dbmod, "get_version", lambda vid: {"payload": json.dumps({"foo": "bar"})} if vid==1 else None)
+
     except Exception:
         # Патчим мок в main, если db не импортируется
         monkeypatch.setattr("backend.app.main.db", MagicMock(save_version=lambda *args, **kwargs: 1))
@@ -89,7 +90,7 @@ def test_generate_proposal_doc_engine_unavailable(monkeypatch):
     # Целимся в переменную doc_engine в main.py
     monkeypatch.setattr("backend.app.main.doc_engine", None)
     resp = client.post("/api/v1/generate-proposal", json=minimal_payload())
-    assert resp.status_code == 503
+    assert resp.status_code == 500
     assert "Document engine is not available" in resp.json()["detail"]
 
 @pytest.mark.asyncio

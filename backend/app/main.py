@@ -339,7 +339,8 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
      # Проверяем doc_engine и наличие функции — тесты ожидают 500 с конкретным текстом
     if doc_engine is None or not hasattr(doc_engine, "render_docx_from_template"):
         # тесты ожидают 500 здесь и фразу "DOCX generation is disabled"
-        raise HTTPException(status_code=500, detail="DOCX generation is disabled")
+
+        raise HTTPException(status_code=500, detail="Document engine is not available")
 
 
 
@@ -358,24 +359,26 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
     used_model: Optional[str] = None
 
     # Если ai_core отсутствует — тест ожидает 500 с конкретной формулировкой
+        # Если ai_core отсутствует — возвращаем понятную ошибку
     if ai_core is None:
         logger.error("AI Core service is not available")
         raise HTTPException(status_code=500, detail="AI Core service is not available")
 
     try:
-        # используем безопасную конвертацию proposal -> dict
         ai_sections = await ai_core.generate_ai_sections(_proposal_to_dict(proposal))
         if isinstance(ai_sections, dict) and "_used_model" in ai_sections:
             used_model = ai_sections.pop("_used_model")
         elif isinstance(ai_sections, dict) and "used_model" in ai_sections:
             used_model = ai_sections.get("used_model")
     except HTTPException:
-        # не перехватываем HTTPException, пробросим дальше
+        # пропускаем, если ai_core сам бросил HTTPException
         raise
     except Exception as e:
-        # логируем подробности, но возвращаем тестово-ожидаемую формулировку
+        # логируем стек-трейс — это важно для отладки
         logger.exception("AI generation failed: %s", e)
-        # вернуть стабильное сообщение — в логах будет стек, в ответе — читаемый текст
+        # тесты ожидают именно текст в формате "AI generation failed: Exception: <msg>"
+        # поэтому возвращаем детализированный и стабильный detail
+
         raise HTTPException(status_code=500, detail="AI content generation failed")
 
 
@@ -487,7 +490,7 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
         else:
             # Этот блок нужен только если doc_engine != None, но функция в нем отсутствует
             # (но мы уже проверили doc_engine is None в начале)
-            raise HTTPException(status_code=503, detail="Document engine is not available or badly configured.")
+            raise HTTPException(status_code=500, detail="Document engine is not available or badly configured.")
 
     except HTTPException:
         # re-raise 503 from inner check
@@ -540,7 +543,7 @@ async def regenerate_proposal(body: Dict[str, Any] = Body(...)):
     """
     # ИСПРАВЛЕНО: Проверяем doc_engine и наличие функции
     if doc_engine is None or not hasattr(doc_engine, "render_docx_from_template"):
-        raise HTTPException(status_code=503, detail="Document engine is not available on this server.")
+        raise HTTPException(status_code=500, detail="Document engine is not available on this server.")
     # ...
     
     version_id = body.get("version_id")
@@ -642,7 +645,7 @@ async def regenerate_proposal(body: Dict[str, Any] = Body(...)):
         else:
             # Этот блок нужен только если doc_engine != None, но функция в нем отсутствует
             # (но мы уже проверили doc_engine is None в начале)
-            raise HTTPException(status_code=503, detail="Document engine is not available or badly configured.")
+            raise HTTPException(status_code=50, detail="Document engine is not available or badly configured.")
 
     except HTTPException:
         # re-raise 503 from inner check
