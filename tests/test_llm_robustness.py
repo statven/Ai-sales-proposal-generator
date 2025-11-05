@@ -4,6 +4,8 @@
 import sys
 import types
 import importlib
+import re
+
 
 # Lightweight stub for prometheus_client if missing
 if "prometheus_client" not in sys.modules:
