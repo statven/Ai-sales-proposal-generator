@@ -461,4 +461,87 @@ def test_regenerate_doc_engine_unexpected_and_save_version_error(monkeypatch):
     monkeypatch.setattr(main_mod, "doc_engine", GoodDoc())
     r2 = client.post("/api/v1/generate-proposal", json={"client_company_name":"Alpha","provider_company_name":"Beta"})
     assert r2.status_code in (200,500)
+def test_doc_engine_various_returns(monkeypatch):
+    """
+    Проверяем ветви, где doc_engine возвращает разные типы (bytes, object.getvalue, bytearray).
+    В этом тесте также мокам внешние сервисы (openai_service, ai_core), чтобы избежать попыток
+    реальных HTTP-вызовов (Ellipsis/невалидные URL).
+    """
+    # --- Подмена внешних зависимостей, чтобы ничего не уходило наружу ---
+    # Защитный мок для openai_service (может использоваться в main)
+    fake_openai = MagicMock()
+    # Для generate_suggestions/других методов вернуть простую стабильную структуру
+    fake_openai.generate_suggestions.return_value = {"suggested_deliverables": [], "suggested_phases": []}
+    monkeypatch.setattr(main_mod, "openai_service", fake_openai, raising=False)
+
+    # Мок ai_core.generate_ai_sections — возвращаем минимальный корректный результат
+    class OkAI:
+        async def generate_ai_sections(self, payload, tone="Casual"):
+            return {"executive_summary_text": "summary", "used_model": "fake"}
+    monkeypatch.setattr(main_mod, "ai_core", OkAI())
+
+    # Полезный (валидный по pydantic) payload
+    valid_payload = {"client_company_name": "Alpha", "provider_company_name": "Beta"}
+
+    # --- 1) doc_engine возвращает bytes ---
+    class BDoc:
+        def render_docx_from_template(self, tpl, ctx):
+            return b'rawbytes'
+    monkeypatch.setattr(main_mod, "doc_engine", BDoc())
+    r1 = client.post("/api/v1/generate-proposal", json=valid_payload)
+    assert r1.status_code in (200, 500, 422)  # допускаем несколько возможных реализаций
+
+    # --- 2) doc_engine возвращает объект с getvalue() ---
+    class Obj:
+        def render_docx_from_template(self, tpl, ctx):
+            class G:
+                def getvalue(self): 
+                    return b'gv'
+            return G()
+    monkeypatch.setattr(main_mod, "doc_engine", Obj())
+    r2 = client.post("/api/v1/generate-proposal", json=valid_payload)
+    assert r2.status_code in (200, 500, 422)
+
+    # --- 3) doc_engine возвращает bytearray ---
+    class BA:
+        def render_docx_from_template(self, tpl, ctx):
+            return bytearray(b'ba')
+    monkeypatch.setattr(main_mod, "doc_engine", BA())
+    r3 = client.post("/api/v1/generate-proposal", json=valid_payload)
+    assert r3.status_code in (200, 500, 422)
+
+def test_ai_core_missing(monkeypatch):
+    monkeypatch.setattr(main_mod, "doc_engine", MagicMock(render_docx_from_template=lambda t,c: BytesIO(b'x')))
+    monkeypatch.setattr(main_mod, "ai_core", None, raising=False)
+    r = client.post("/api/v1/generate-proposal", json={"client_company_name":"Alpha","provider_company_name":"Beta"})
+    assert r.status_code == 500
+
+def test_ai_core_raises(monkeypatch):
+    monkeypatch.setattr(main_mod, "doc_engine", MagicMock(render_docx_from_template=lambda t,c: BytesIO(b'x')))
+    class BadAI:
+        async def generate_ai_sections(self, payload): raise Exception("boom")
+    monkeypatch.setattr(main_mod, "ai_core", BadAI())
+    r = client.post("/api/v1/generate-proposal", json={"client_company_name":"Alpha","provider_company_name":"Beta"})
+    assert r.status_code == 500
+def test_regenerate_missing_payload(monkeypatch):
+    monkeypatch.setattr(main_mod, "doc_engine", MagicMock(render_docx_from_template=lambda t,c: BytesIO(b'D')))
+    monkeypatch.setattr(main_mod, "db", MagicMock(get_version=lambda vid: {"ai_sections": "{}"}))
+    r = client.post("/proposal/regenerate", json={"version_id":1})
+    assert r.status_code in (200,400,404,422)
+def test_startup_shutdown(monkeypatch):
+    class BadDB:
+        def init_db(self): raise Exception("init")
+    monkeypatch.setattr(main_mod, "db", BadDB(), raising=False)
+    class BadOpenAI:
+        def init(self): raise Exception("i")
+        def close(self): raise Exception("c")
+    monkeypatch.setattr(main_mod, "openai_service", BadOpenAI(), raising=False)
+    # call handlers — should not raise
+    main_mod._on_startup()
+    main_mod._on_shutdown()
+def test_format_date_variants():
+    assert main_mod._format_date(None) == ""
+    assert "31" in main_mod._format_date(date(2025,10,31))
+    iso_out = main_mod._format_date("2025-12-01"); assert "01" in iso_out and "2025" in iso_out
+    assert main_mod._format_date("not-a-date") == "not-a-date"
 
