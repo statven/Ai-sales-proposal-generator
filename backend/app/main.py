@@ -14,7 +14,7 @@ from urllib.parse import quote
 import asyncio
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from fastapi.responses import Response
-
+from backend.app.services import visualization_service as vis
 
 
 
@@ -487,77 +487,77 @@ def _sanitize_ai_text(s: Optional[str], context: Dict[str, Any]) -> str:
 # ----------------- End helpers -----------------
 @app.post("/api/v1/generate-proposal", tags=["Proposal Generation"])
 async def generate_proposal(payload: Dict[str, Any] = Body(...)):
+    # 0. Проверки существования doc_engine
     if doc_engine is None or not hasattr(doc_engine, "render_docx_from_template"):
-
+        logger.error("Document engine is not available or missing render function.")
         raise HTTPException(status_code=500, detail="Document engine is not available")
 
+    # 1. Нормализация входа (используйте существующую helper-функцию)
+    try:
+        normalized = _normalize_incoming_payload(payload)
+    except Exception as e:
+        logger.exception("Failed to normalize incoming payload: %s", e)
+        raise HTTPException(status_code=400, detail=f"Payload normalization failed: {e}")
 
-
-
-    # ...
-    normalized = _normalize_incoming_payload(payload)
-
+    # 2. Валидация Pydantic
     try:
         proposal = ProposalInput(**normalized)
     except ValidationError as ve:
         logger.warning("Validation failed for incoming proposal: %s", ve.json())
         return JSONResponse(status_code=422, content={"detail": ve.errors()})
 
-    # AI generation
+    # 3. AI generation — поддерживаем новые и старые интерфейсы ai_core
     ai_sections: Dict[str, Any] = {}
     used_model: Optional[str] = None
 
-    # Если ai_core отсутствует — тест ожидает 500 с конкретной формулировкой
-        # Если ai_core отсутствует — возвращаем понятную ошибку
     if ai_core is None:
         logger.error("AI Core service is not available")
         raise HTTPException(status_code=500, detail="AI Core service is not available")
 
     try:
-        ai_sections = await ai_core.generate_ai_sections(_proposal_to_dict(proposal))
-        if isinstance(ai_sections, dict) and "_used_model" in ai_sections:
-            used_model = ai_sections.pop("_used_model")
-        elif isinstance(ai_sections, dict) and "used_model" in ai_sections:
-            used_model = ai_sections.get("used_model")
+        # Prefer process_ai_content if present (it returns (sections, used_model))
+        if hasattr(ai_core, "process_ai_content"):
+            try:
+                sections_and_model = await ai_core.process_ai_content(_proposal_to_dict(proposal), tone=normalized.get("tone", "Formal"))
+                # process_ai_content expected to return (dict, model_str)
+                if isinstance(sections_and_model, tuple) and len(sections_and_model) == 2:
+                    ai_sections, used_model = sections_and_model
+                elif isinstance(sections_and_model, dict):
+                    ai_sections = sections_and_model
+                else:
+                    ai_sections = sections_and_model or {}
+            except TypeError:
+                # In case process_ai_content is sync or signature differs, call via thread
+                import asyncio
+                res = await asyncio.to_thread(ai_core.process_ai_content, _proposal_to_dict(proposal), normalized.get("tone", "Formal"))
+                if isinstance(res, tuple) and len(res) == 2:
+                    ai_sections, used_model = res
+                elif isinstance(res, dict):
+                    ai_sections = res
+        else:
+            # Backwards compatibility: old generate_ai_sections returning dict
+            if hasattr(ai_core, "generate_ai_sections"):
+                ai_sections = await ai_core.generate_ai_sections(_proposal_to_dict(proposal))
+            else:
+                logger.error("ai_core has neither process_ai_content nor generate_ai_sections")
+                raise HTTPException(status_code=500, detail="AI Core service is not available")
+        # extract used_model if embedded in ai_sections
+        if isinstance(ai_sections, dict):
+            if "_used_model" in ai_sections:
+                used_model = ai_sections.pop("_used_model")
+            elif "used_model" in ai_sections:
+                used_model = ai_sections.get("used_model")
     except HTTPException:
-        # пропускаем, если ai_core сам бросил HTTPException
+        # propagate HTTPException from ai_core (tests depend on this behavior)
         raise
-   # (ИСПРАВЛЕНИЕ)
     except Exception as e:
-    # ...
         logger.exception("AI generation failed: %s", e)
-    # (FIX) Возвращаем детальное сообщение, как того ожидает test_main_api.py
+        # Return explicit error detail as expected by tests
         raise HTTPException(status_code=500, detail=f"AI generation failed: Exception: {str(e)}")
 
-
-
-    # Build context
-    # Build context for doc engine
+    # 4. Build base context for doc_engine
     context = _proposal_to_dict(proposal)
-    # Ensure alias access (also add alias names to context for template)
-    context["client_company_name"] = context.get("client_name") or context.get("client_company_name","")
-    context["provider_company_name"] = context.get("provider_name") or context.get("provider_company_name","")
-
-    # signature fields: prefer values from original normalized payload if provided
-    context["client_signature_name"] = payload.get("client_signature_name") or context.get("client_signature_name","")
-    context["client_signature_date"] = payload.get("client_signature_date") or context.get("client_signature_date","")
-    context["provider_signature_name"] = payload.get("provider_signature_name") or context.get("provider_signature_name","")
-    context["provider_signature_date"] = payload.get("provider_signature_date") or context.get("provider_signature_date","")
-
-    # keep UI helper dates if provided originally
-    if "proposal_date" in payload:
-        context["proposal_date"] = payload.get("proposal_date")
-    if "valid_until_date" in payload:
-        context["valid_until_date"] = payload.get("valid_until_date")
-    # signatures: ensure keys exist (avoid leaving placeholders un-replaced)
-    # Если пользователь не передал имя/дату подписи — подставляем видимый заполнитель
-
-
-    # даты подписи — оставляем пустыми если не заданы (в формате dd Month YYYY если заданы)
-    context["client_signature_date"] = _format_date(context.get("client_signature_date"))
-    context["provider_signature_date"] = _format_date(context.get("provider_signature_date"))
-
-    # ensure both naming variants exist for templates and sanitization
+    # Ensure both naming variants exist
     client_name_val = context.get("client_company_name") or context.get("client_name") or ""
     provider_name_val = context.get("provider_company_name") or context.get("provider_name") or ""
     context["client_company_name"] = client_name_val
@@ -565,89 +565,149 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
     context["provider_company_name"] = provider_name_val
     context["provider_name"] = provider_name_val
 
-    # sanitize AI text (replace placeholders embedded in LLM output)
+    # Prefer signature fields from raw payload if provided
+    context["client_signature_name"] = payload.get("client_signature_name") or context.get("client_signature_name","")
+    context["client_signature_date"] = payload.get("client_signature_date") or context.get("client_signature_date","")
+    context["provider_signature_name"] = payload.get("provider_signature_name") or context.get("provider_signature_name","")
+    context["provider_signature_date"] = payload.get("provider_signature_date") or context.get("provider_signature_date","")
+
+    # Keep original dates if present (proposal_date, valid_until_date) — don't override with normalized conversions yet
+    if "proposal_date" in payload:
+        context["proposal_date"] = payload.get("proposal_date")
+    if "valid_until_date" in payload:
+        context["valid_until_date"] = payload.get("valid_until_date")
+
+    # 5. Sanitize ai_sections (replace any placeholders they may include)
     if isinstance(ai_sections, dict):
         for k, v in list(ai_sections.items()):
-            ai_sections[k] = _sanitize_ai_text(v, context)
+            try:
+                ai_sections[k] = _sanitize_ai_text(v, context)
+            except Exception:
+                # if sanitize fails, fallback to string conversion
+                try:
+                    ai_sections[k] = "" if v is None else str(v)
+                except Exception:
+                    ai_sections[k] = ""
+    else:
+        ai_sections = {}
 
-    # merge AI sections into context (AI text now sanitized)
-    if isinstance(ai_sections, dict):
-        context.update(ai_sections)
+    # 6. Merge AI sections into context carefully
+    # textual keys (ensure they exist)
+    textual_keys = [
+        "executive_summary_text","project_mission_text","solution_concept_text",
+        "project_methodology_text","financial_justification_text","payment_terms_text",
+        "development_note","licenses_note","support_note"
+    ]
+    for k in textual_keys:
+        if k in ai_sections:
+            context[k] = ai_sections.get(k) or ""
+        else:
+            # leave existing context value or set empty string to avoid placeholder leaking
+            context.setdefault(k, "")
 
-    # convert lists & keys for doc engine
-    _prepare_list_data(context)
+    # Suggested deliverables/phases fallbacks
+    suggested_deliverables = ai_sections.get("suggested_deliverables") or ai_sections.get("deliverables") or []
+    suggested_phases = ai_sections.get("suggested_phases") or ai_sections.get("phases") or []
 
-    # computed/flattened fields
-    context["current_date"] = _format_date(date.today())
-    context["expected_completion_date"] = _format_date(context.get("deadline"))
-    context["proposal_date"] = _format_date(context.get("proposal_date"))
-    context["valid_until_date"] = _format_date(context.get("valid_until_date"))
+    # Merge into canonical keys expected by doc engine
+    # doc engine historically expects 'deliverables_list' and 'phases_list'
+    # Accept both payload-provided and ai-suggested: manual priority
+    if context.get("deliverables") and isinstance(context.get("deliverables"), list) and len(context.get("deliverables"))>0:
+        context["deliverables_list"] = context.get("deliverables")
+    else:
+        context["deliverables_list"] = suggested_deliverables or []
 
-    # signatures: ensure keys exist (avoid leaving placeholders un-replaced)
-    context["client_signature_name"] = context.get("client_signature_name") or ""
-    context["provider_signature_name"] = context.get("provider_signature_name") or ""
-    context["client_signature_date"] = _format_date(context.get("client_signature_date"))
-    context["provider_signature_date"] = _format_date(context.get("provider_signature_date"))
+    if context.get("phases") and isinstance(context.get("phases"), list) and len(context.get("phases"))>0:
+        context["phases_list"] = context.get("phases")
+    else:
+        context["phases_list"] = suggested_phases or []
 
-    # financials flatten / totals
+    # 7. Visualization: normalize ai_sections["visualization"] into context for doc_engine
+    viz = {}
+    if isinstance(ai_sections.get("visualization"), dict):
+        viz = ai_sections.get("visualization")
+    else:
+        # try top-level keys (backwards compatibility)
+        viz = {
+            "components": ai_sections.get("components") or context.get("components") or [],
+            "infrastructure": ai_sections.get("infrastructure") or context.get("infrastructure") or [],
+            "data_flows": ai_sections.get("data_flows") or context.get("data_flows") or [],
+            "connections": ai_sections.get("connections") or context.get("connections") or [],
+            "milestones": ai_sections.get("milestones") or context.get("milestones") or []
+        }
+    context["visualization"] = viz
+
+    # 8. Prepare lists and flatten any nested structures for doc template
+    try:
+        _prepare_list_data(context)
+    except Exception:
+        # log but do not fail - doc engine will handle empties
+        logger.exception("Preparing list data failed; continuing with naive context.")
+
+    # 9. computed/flattened fields and date formatting
+    try:
+        context["current_date"] = _format_date(date.today())
+        context["expected_completion_date"] = _format_date(context.get("deadline"))
+        context["proposal_date"] = _format_date(context.get("proposal_date"))
+        context["valid_until_date"] = _format_date(context.get("valid_until_date"))
+    except Exception:
+        logger.exception("Date formatting failed; using raw values")
+
+    # signature defaults — visible placeholders if names missing
+    _default_sig_line = "_________________________"
+    context["client_signature_name"] = context.get("client_signature_name") or context.get("client_name") or context.get("client_company_name") or _default_sig_line
+    context["provider_signature_name"] = context.get("provider_signature_name") or context.get("provider_name") or context.get("provider_company_name") or _default_sig_line
+
+    # Format signature dates for human-readable strings (if provided)
+    try:
+        def _format_signature_date(val):
+            if not val:
+                return ""
+            if isinstance(val, str):
+                try:
+                    d = date.fromisoformat(val)
+                    return d.strftime("%d %B %Y")
+                except Exception:
+                    return val
+            if isinstance(val, date):
+                return val.strftime("%d %B %Y")
+            return str(val)
+        context["client_signature_date"] = _format_signature_date(context.get("client_signature_date"))
+        context["provider_signature_date"] = _format_signature_date(context.get("provider_signature_date"))
+    except Exception:
+        logger.exception("Failed to format signature dates; leaving raw values.")
+
+    # 10. Financial fields (flatten)
     if context.get("financials") and isinstance(context["financials"], dict):
         fin = context["financials"]
         context["development_cost"] = fin.get("development_cost")
         context["licenses_cost"] = fin.get("licenses_cost")
         context["support_cost"] = fin.get("support_cost")
-        context["total_investment_cost"] = _calculate_total_investment(fin)
+        try:
+            context["total_investment_cost"] = _calculate_total_investment(fin)
+        except Exception:
+            # best-effort sum fallback
+            try:
+                total = 0.0
+                for k in ("development_cost","licenses_cost","support_cost"):
+                    v = fin.get(k) or 0.0
+                    total += float(v)
+                context["total_investment_cost"] = total
+            except Exception:
+                context["total_investment_cost"] = None
 
     logger.debug("Rendering context keys: %s", sorted(list(context.keys())))
-    # Render DOCX
-    def _format_signature_date(val):
-        if val is None or val == "":
-            return ""
-        # if already a date-like iso string, try parse and pretty-format
-        try:
-            if isinstance(val, str):
-                # try ISO parse
-                try:
-                    dt = date.fromisoformat(val)
-                    # readable: 31 October 2025 (you can adapt to locale if needed)
-                    return dt.strftime("%d %B %Y")
-                except Exception:
-                    return val
-            if isinstance(val, date):
-                return val.strftime("%d %B %Y")
-        except Exception:
-            pass
-        return str(val)
 
-    # Default visible line for missing name (so placeholder doesn't disappear visually)
-    _default_sig_line = "_________________________"
-
-    # Ensure keys exist — take from context if present, otherwise safe fallback
-    context["client_signature_name"] = context.get("client_signature_name") or context.get("client_name") or context.get("client_company_name") or _default_sig_line
-    context["provider_signature_name"] = context.get("provider_signature_name") or context.get("provider_name") or context.get("provider_company_name") or _default_sig_line
-
-    # Format signature dates (empty string if missing)
-    context["client_signature_date"] = _format_signature_date(context.get("client_signature_date") or context.get("client_signature_date_iso") or "")
-    context["provider_signature_date"] = _format_signature_date(context.get("provider_signature_date") or context.get("provider_signature_date_iso") or "")
-
-    # Now render_docx_from_template(...) can safely replace {{client_signature_name}} etc.
-
+    # 11. Render DOCX
     try:
-        # УПРОЩЕНО: Убираем дублирующуюся проверку, оставляем вызов через doc_engine
-        if doc_engine and hasattr(doc_engine, "render_docx_from_template"):
-            doc_out = doc_engine.render_docx_from_template(TEMPLATE_PATH, context)
-        else:
-            # Этот блок нужен только если doc_engine != None, но функция в нем отсутствует
-            # (но мы уже проверили doc_engine is None в начале)
-            raise HTTPException(status_code=500, detail="Document engine is not available or badly configured.")
-
+        doc_out = doc_engine.render_docx_from_template(TEMPLATE_PATH, context)
     except HTTPException:
-        # re-raise 503 from inner check
         raise
     except Exception as e:
         logger.exception("DOCX rendering failed: %s", e)
         raise HTTPException(status_code=500, detail=f"DOCX rendering failed: {type(e).__name__}: {str(e)}")
 
-    # get bytes
+    # 12. Extract bytes robustly
     try:
         if isinstance(doc_out, BytesIO):
             doc_bytes = doc_out.getvalue()
@@ -656,32 +716,34 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
         elif isinstance(doc_out, (bytes, bytearray)):
             doc_bytes = bytes(doc_out)
         else:
-            # Added more explicit error handling for unexpected return type
             logger.error("DOCX generation returned unexpected type: %s", type(doc_out))
-            raise TypeError("DOCX generation returned unexpected type")
+            raise HTTPException(status_code=500, detail="DOCX generation returned unexpected type")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Failed to extract bytes from doc engine output: %s", e)
         raise HTTPException(status_code=500, detail="DOCX generation returned unexpected type")
 
+    # 13. Save version (best-effort)
     version_id = None
     try:
         version_id = db.save_version(payload=_proposal_to_dict(proposal), ai_sections=ai_sections or {}, used_model=used_model)
     except Exception as e:
-        # тест явно ждёт вызов logger.error
         logger.error("Error saving proposal version: %s", e)
         version_id = None
 
-
-
-
+    # 14. Build filename and headers, return StreamingResponse
     filename = f"{_safe_filename(context.get('client_company_name') or '')}_{_safe_filename(context.get('project_goal') or '')}.docx"
     encoded = quote(filename)
     headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{encoded}"}
     if version_id:
         headers["X-Proposal-Version"] = str(version_id)
 
-    return StreamingResponse(BytesIO(doc_bytes), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers=headers)
-
+    return StreamingResponse(
+        BytesIO(doc_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers=headers
+    )
 
 
 @app.post("/proposal/regenerate", tags=["Proposal Generation"])
@@ -735,9 +797,44 @@ async def regenerate_proposal(body: Dict[str, Any] = Body(...)):
 
     # Build context and merge ai_sections if present — IMPORTANT: by_alias=True
     context = proposal.dict(by_alias=True, exclude_none=True)
-    if isinstance(ai_sections, dict):
-        context.update(ai_sections)
+    # --- FIX: extract visualization subfields if present ---
+    vis = ai_sections.get("visualization") if isinstance(ai_sections, dict) else None
+    if isinstance(vis, dict):
+        # раскладываем вложенные поля, чтобы шаблон смог их подставить
+        context["components"] = vis.get("components", [])
+        context["infrastructure"] = vis.get("infrastructure", [])
+        context["data_flows"] = vis.get("data_flows", [])
+        context["connections"] = vis.get("connections", [])
+        context["milestones"] = vis.get("milestones", [])
 
+        # Для совместимости со старыми шаблонами:
+        context["uml_diagram"] = vis.get("components", [])
+        context["dataflow_diagram"] = vis.get("data_flows", [])
+        context["deployment_diagram"] = vis.get("infrastructure", [])
+
+    try:
+        context["uml_diagram"] = vis.generate_component_diagram(context)
+    except Exception as e:
+        logger.warning("UML diagram generation failed: %s", e)
+        context["uml_diagram"] = b""
+
+    try:
+        context["dataflow_diagram"] = vis.generate_dataflow_diagram(context)
+    except Exception as e:
+        logger.warning("Dataflow diagram generation failed: %s", e)
+        context["dataflow_diagram"] = b""
+
+    try:
+        context["deployment_diagram"] = vis.generate_deployment_diagram(context)
+    except Exception as e:
+        logger.warning("Deployment diagram generation failed: %s", e)
+        context["deployment_diagram"] = b""
+
+    try:
+        context["gantt_chart"] = vis.generate_gantt_image(context)
+    except Exception as e:
+        logger.warning("Gantt chart generation failed: %s", e)
+        context["gantt_chart"] = b""
     _prepare_list_data(context)
     context["current_date"] = _format_date(date.today())
     context["expected_completion_date"] = _format_date(context.get("deadline"))

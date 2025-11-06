@@ -8,19 +8,16 @@ Provides:
 - generate_deployment_diagram(proposal) -> bytes
 - generate_gantt_image(proposal) -> bytes
 
-Input `proposal` is flexible: keys may be dicts/lists/strings/JSON-encoded strings.
-Expected canonical keys:
-- components: list[dict{id,title,description,type,depends_on,host}]
-- data_flows: list[dict{from,to,label}] or list[str] "a->b: label"
-- infrastructure: list[dict{node,label,type}]
-- milestones / phases_list: list[dict{name,start,end,duration_days,percent_complete,owner}]
+This version is robust against string/json inputs, unsafe characters in labels,
+and Graphviz label formatting issues.
 """
 import io
 import json
 import logging
 import datetime
-from typing import Dict, Any, List, Optional
 import re
+from typing import Dict, Any, List, Optional
+
 import pandas as pd
 import plotly.express as px
 import plotly.io as pio
@@ -36,22 +33,46 @@ def _ensure_list(x):
         return []
     if isinstance(x, list):
         return x
-    # if JSON string or JSON object in string
+    if isinstance(x, (tuple, set)):
+        return list(x)
     if isinstance(x, str):
         s = x.strip()
-        # try parse JSON list/object
+        # try parse JSON
         try:
             parsed = json.loads(s)
             if isinstance(parsed, list):
                 return parsed
             return [parsed]
         except Exception:
-            # treat as comma-separated identifiers
+            # comma-separated (but ignore "->" flows)
             if "," in s and "->" not in s:
                 return [p.strip() for p in s.split(",") if p.strip()]
             return [s]
-    # anything else -> single element list
     return [x]
+
+
+def _safe_id(s: Optional[str]) -> str:
+    if s is None:
+        s = "n"
+    s = str(s)
+    # replace non-alnum with underscore
+    s = re.sub(r'[^0-9A-Za-z_]', '_', s)
+    if not s:
+        s = "n"
+    return s
+
+
+def _sanitize_label(s: Optional[str], max_len: int = 200) -> str:
+    if s is None:
+        return ""
+    s = str(s).replace("\r", " ").replace("\n", " ").strip()
+    # remove characters that break labels or record syntax
+    for ch in ['{', '}', '|', '<', '>', '"', '\\', '\t']:
+        s = s.replace(ch, ' ')
+    s = re.sub(r'\s+', ' ', s).strip()
+    if len(s) > max_len:
+        s = s[:max_len - 3] + "..."
+    return s
 
 
 def _normalize_components(raw) -> List[Dict[str, Any]]:
@@ -59,22 +80,21 @@ def _normalize_components(raw) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for i, c in enumerate(items):
         if isinstance(c, dict):
-            # ensure keys exist
+            depends = c.get("depends_on") or c.get("depends") or c.get("dependsOn") or []
+            if isinstance(depends, str):
+                depends = [p.strip() for p in depends.split(",") if p.strip()]
             normalized = {
                 "id": str(c.get("id") or c.get("title") or f"comp_{i}"),
                 "title": str(c.get("title") or c.get("id") or f"Component {i+1}"),
-                "description": str(c.get("description") or ""),
-                "type": str(c.get("type") or "service").lower(),
-                "depends_on": c.get("depends_on") or c.get("depends") or [],
+                "description": str(c.get("description") or c.get("desc") or ""),
+                "type": str((c.get("type") or "service")).lower(),
+                "depends_on": depends,
                 "host": c.get("host") or c.get("node") or None
             }
-            # ensure depends_on is list of ids
-            if isinstance(normalized["depends_on"], str):
-                normalized["depends_on"] = [s.strip() for s in normalized["depends_on"].split(",") if s.strip()]
             out.append(normalized)
             continue
         if isinstance(c, str):
-            # try parse JSON object encoded in string
+            # try JSON decode string element
             try:
                 parsed = json.loads(c)
                 if isinstance(parsed, dict):
@@ -91,7 +111,6 @@ def _normalize_components(raw) -> List[Dict[str, Any]]:
                 "host": None
             })
             continue
-        # fallback coercion
         out.append({
             "id": f"comp_{i}",
             "title": str(c),
@@ -116,17 +135,17 @@ def _normalize_flows(raw) -> List[Dict[str, Any]]:
             continue
         if isinstance(f, str):
             s = f.strip()
-            # pattern: a->b: label
+            # pattern: A->B: label
+            if "->" in s:
+                left, right = s.split("->", 1)
+                if ":" in right:
+                    dst, lbl = right.split(":", 1)
+                    out.append({"from": left.strip(), "to": dst.strip(), "label": lbl.strip()})
+                else:
+                    out.append({"from": left.strip(), "to": right.strip(), "label": ""})
+                continue
+            # try json
             try:
-                if "->" in s:
-                    left, right = s.split("->", 1)
-                    if ":" in right:
-                        dst, lbl = right.split(":", 1)
-                        out.append({"from": left.strip(), "to": dst.strip(), "label": lbl.strip()})
-                    else:
-                        out.append({"from": left.strip(), "to": right.strip(), "label": ""})
-                    continue
-                # maybe json
                 parsed = json.loads(s)
                 if isinstance(parsed, dict):
                     out.append({
@@ -137,7 +156,6 @@ def _normalize_flows(raw) -> List[Dict[str, Any]]:
                     continue
             except Exception:
                 pass
-            # fallback: treat as a node -> a (self flow)
             out.append({"from": s, "to": s, "label": ""})
             continue
         out.append({"from": str(f), "to": str(f), "label": ""})
@@ -167,7 +185,6 @@ def _normalize_milestones(raw) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for i, m in enumerate(items):
         if isinstance(m, dict):
-            # accept many possible names
             out.append({
                 "name": str(m.get("name") or m.get("title") or f"Milestone {i+1}"),
                 "start": m.get("start") or m.get("from") or m.get("begin") or None,
@@ -178,17 +195,14 @@ def _normalize_milestones(raw) -> List[Dict[str, Any]]:
             })
             continue
         if isinstance(m, str):
-            s = m.strip()
-            # try JSON
             try:
-                parsed = json.loads(s)
+                parsed = json.loads(m)
                 if isinstance(parsed, dict):
                     out.extend(_normalize_milestones([parsed]))
                     continue
             except Exception:
                 pass
-            # try pipe-separated: name|start|end|owner|percent
-            parts = [p.strip() for p in s.split("|")]
+            parts = [p.strip() for p in m.split("|")]
             if len(parts) >= 3:
                 pct = 0.0
                 try:
@@ -204,15 +218,13 @@ def _normalize_milestones(raw) -> List[Dict[str, Any]]:
                     "owner": parts[3] if len(parts) > 3 else ""
                 })
                 continue
-            # fallback: name-only
-            out.append({"name": s, "start": None, "end": None, "duration_days": None, "percent_complete": 0.0, "owner": ""})
+            out.append({"name": m, "start": None, "end": None, "duration_days": None, "percent_complete": 0.0, "owner": ""})
             continue
         out.append({"name": str(m), "start": None, "end": None, "duration_days": None, "percent_complete": 0.0, "owner": ""})
     return out
 
 
 def _to_datetime(obj) -> Optional[datetime.datetime]:
-    """Convert ISO/date/datetime-like to datetime or return None."""
     if obj is None:
         return None
     if isinstance(obj, datetime.datetime):
@@ -223,7 +235,6 @@ def _to_datetime(obj) -> Optional[datetime.datetime]:
         s = obj.strip()
         if not s:
             return None
-        # try several formats
         fmts = ("%Y-%m-%d", "%Y/%m/%d", "%d.%m.%Y", "%d-%m-%Y", "%Y-%m-%dT%H:%M:%S")
         for f in fmts:
             try:
@@ -238,91 +249,85 @@ def _to_datetime(obj) -> Optional[datetime.datetime]:
         return pd.to_datetime(obj).to_pydatetime()
     except Exception:
         return None
-def _sanitize_label(s: Optional[str], max_len: int = 200) -> str:
-    """Make a safe label string for Graphviz: remove braces/pipe/angle quotes, shorten, remove newlines."""
-    if s is None:
-        return ""
-    s = str(s)
-    # replace newlines with space
-    s = s.replace("\r", " ").replace("\n", " ").strip()
-    # remove characters that break simple labels or record syntax
-    for ch in ['{', '}', '|', '<', '>', '"', '\\', '\t']:
-        s = s.replace(ch, ' ')
-    # collapse multiple spaces
-    s = re.sub(r'\s+', ' ', s).strip()
-    if len(s) > max_len:
-        s = s[:max_len-3] + "..."
-    return s
-
-def _safe_id(s: str) -> str:
-    """Create a safe node id: only letters, digits, underscore."""
-    if s is None:
-        return ""
-    s = str(s)
-    s = re.sub(r'[^0-9A-Za-z_]', '_', s)
-    if not s:
-        s = "n"
-    return s
 
 
 # ----------------- placeholder PNG -----------------
 
 def _placeholder_png_bytes(text: str = "Diagram unavailable", width: int = 1200, height: int = 300) -> bytes:
-    # Very small white PNG (static) to avoid PIL dependency; better than failing
-    # If you prefer, replace with PIL-generated image.
     return b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0bIDATx\x9cc`\x00\x00\x00\x02\x00\x01\xe2!\xbc3\x00\x00\x00\x00IEND\xaeB`\x82'
 
 
 # ----------------- Diagram generators -----------------
 
 def generate_component_diagram(proposal: Dict[str, Any], width: int = 1400) -> bytes:
-    """
-    Component / simple UML-like diagram.
-    Nodes: components with title + short description.
-    Edges: depends_on relationships.
-    Types: service, db, ui, external -> color-coding.
-    """
     try:
-        comps = _normalize_components(proposal.get("components"))
+        comps_raw = proposal.get("components") if isinstance(proposal, dict) else None
+        comps = _normalize_components(comps_raw)
+
         if not comps:
-            # try synthesize from keys
-            for k in list(proposal.keys())[:6]:
+            # synthesize small set from top-level keys
+            for i, k in enumerate(list(proposal.keys())[:6]):
                 comps.append({"id": k, "title": k, "description": str(proposal.get(k) or ""), "type": "service", "depends_on": []})
+
+        # build safe id mapping and ensure uniqueness
+        used_ids = set()
+        comp_map = {}
+        for c in comps:
+            orig = str(c.get("id") or c.get("title") or "")
+            base = _safe_id(orig)
+            sid = base
+            suffix = 1
+            while sid in used_ids:
+                sid = f"{base}_{suffix}"
+                suffix += 1
+            used_ids.add(sid)
+            comp_map[orig] = sid
+            # also map by title
+            comp_map[str(c.get("title") or "")] = sid
 
         dot = Digraph(format="png")
         dot.attr("graph", rankdir="LR", fontsize="10", fontname="Arial")
-        dot.attr("node", shape="record", style="rounded,filled", fontname="Arial", fontsize="10")
+        dot.attr("node", shape="box", style="rounded,filled", fontname="Arial", fontsize="10")
         dot.attr("edge", fontname="Arial", fontsize="9", color="#333333")
 
         colors = {"service": "#e8f4ff", "db": "#fff4e6", "ui": "#f3fff0", "external": "#f7f7f7", "default": "#ffffff"}
 
-        # add nodes
+        # create nodes (use safe ids)
         for c in comps:
-            cid = str(c.get("id"))
-            title = str(c.get("title") or cid)
-            desc = str(c.get("description") or "")
-            if len(desc) > 120:
-                desc = desc[:117] + "..."
-            label = f'{{{title}|{desc}}}'
+            orig = str(c.get("id") or c.get("title") or "")
+            sid = comp_map.get(orig) or _safe_id(orig)
+            title = _sanitize_label(c.get("title") or orig, max_len=80)
+            desc = _sanitize_label(c.get("description") or "", max_len=140)
+            label = title if not desc else f"{title}\\n{desc}"
             t = (c.get("type") or "default").lower()
             fill = colors.get(t, colors["default"])
-            dot.node(cid, label=label, fillcolor=fill)
+            dot.node(sid, label=label, fillcolor=fill)
 
-        # add edges (depends_on)
+        # add edges (resolve depends_on)
         for c in comps:
-            cid = str(c.get("id"))
+            dest_orig = str(c.get("id") or c.get("title") or "")
+            dest_sid = comp_map.get(dest_orig) or _safe_id(dest_orig)
             deps = c.get("depends_on") or []
             if isinstance(deps, str):
-                deps = [s.strip() for s in deps.split(",") if s.strip()]
+                deps = [d.strip() for d in deps.split(",") if d.strip()]
             for d in deps:
                 if not d:
                     continue
-                dot.edge(str(d), cid, arrowhead="vee")
-
-        # add legend as separate small nodes
-        # optional: keep simple legend node
-        legend_html = "{{Legend|Service|DB|UI|External}}"
-        # don't force legend if graphviz breaks; skip adding
+                # try direct mapping, fall back to title mapping
+                src_sid = comp_map.get(str(d))
+                if not src_sid:
+                    # try find by title case-insensitive
+                    for cc in comps:
+                        if str(cc.get("title") or "").strip().lower() == str(d).strip().lower():
+                            src_sid = comp_map.get(str(cc.get("id") or cc.get("title")))
+                            break
+                if not src_sid:
+                    # create a minimal node for unknown id
+                    src_sid = _safe_id(d)
+                    if src_sid not in used_ids:
+                        used_ids.add(src_sid)
+                        dot.node(src_sid, label=_sanitize_label(str(d), max_len=80), fillcolor="#f7f7f7")
+                dot.edge(src_sid, dest_sid, arrowhead="vee", color="#2b7cff")
 
         try:
             png = dot.pipe(format="png")
@@ -337,101 +342,88 @@ def generate_component_diagram(proposal: Dict[str, Any], width: int = 1400) -> b
 
 
 def generate_dataflow_diagram(proposal: Dict[str, Any], width: int = 1400) -> bytes:
-    """
-    Professional Data Flow Diagram (DFD) generator.
-
-    - Processes: boxes (label = title + short desc)
-    - Data stores: cylinders
-    - External entities: ovals
-    - Flows: labeled directed edges
-    - Layout: left-to-right (rankdir=LR)
-    """
     try:
-        comps_list = _normalize_components(proposal.get("components") if isinstance(proposal, dict) else None)
+        comps = _normalize_components(proposal.get("components") if isinstance(proposal, dict) else None)
         flows = _normalize_flows(proposal.get("data_flows") if isinstance(proposal, dict) else None)
 
-        # Map ids -> component dict, also map titles to ids
-        id_map = {}
-        for c in comps_list:
-            cid = _safe_id(c.get("id") or c.get("title") or f"comp_{len(id_map)}")
-            id_map[cid] = c
-            # also keep reverse lookup by title
-            title_key = str(c.get("title") or "").strip()
-            if title_key:
-                id_map[_safe_id(title_key)] = c
+        # Node registry
+        nodes = {}
+        used_ids = set()
+
+        # create nodes from components
+        for c in comps:
+            orig = str(c.get("id") or c.get("title") or "")
+            sid = _safe_id(orig)
+            # ensure unique
+            sbase = sid
+            suffix = 1
+            while sid in used_ids:
+                sid = f"{sbase}_{suffix}"
+                suffix += 1
+            used_ids.add(sid)
+            nodes[sid] = {"title": _sanitize_label(c.get("title") or orig, max_len=120), "type": c.get("type", "service"), "desc": _sanitize_label(c.get("description") or "")}
 
         dot = Digraph(format="png")
         dot.attr("graph", rankdir="LR", fontsize="10", fontname="Arial")
         dot.attr("node", fontname="Arial")
 
-        # create nodes: decide shape by type detection
-        created = set()
-        for cid, c in list(id_map.items()):
-            # We want unique node per canonical id (not duplicate title keys)
-            canonical_id = _safe_id(c.get("id") or c.get("title") or cid)
-            if canonical_id in created:
-                continue
-            created.add(canonical_id)
-
-            title = _sanitize_label(c.get("title") or canonical_id, max_len=120)
-            desc = _sanitize_label(c.get("description") or "", max_len=160)
-            ttype = (c.get("type") or "").lower()
-
-            # choose shape
-            if ttype in ("db", "database", "datastore") or "db" in title.lower() or "store" in title.lower():
+        # create nodes
+        for nid, meta in nodes.items():
+            label = meta["title"]
+            if meta["desc"]:
+                label = f"{label}\\n{meta['desc']}"
+            # choose shape by detection
+            t = (meta.get("type") or "").lower()
+            if "db" in t or "store" in label.lower():
                 shape = "cylinder"
-            elif ttype in ("external", "actor") or "external" in title.lower() or "client" in title.lower():
+            elif "external" in t or "actor" in t or "client" in label.lower():
                 shape = "oval"
-            elif ttype in ("ui", "frontend") or "ui" in title.lower():
+            elif "ui" in t or "frontend" in label.lower():
                 shape = "component"
             else:
-                # processes are boxes
                 shape = "box"
+            dot.node(nid, label=label, shape=shape, style="rounded,filled", fillcolor="#ffffff")
 
-            label = title
-            if desc:
-                # multi-line label "Title\n(desc...)"
-                label = f"{title}\\n{desc}"
-            # ensure label safe (no braces/|)
-            label = _sanitize_label(label, max_len=220)
-            dot.node(canonical_id, label=label, shape=shape, style="rounded,filled", fillcolor="#ffffff")
+        # ensure helper: resolve a name to an existing node id by title or id
+        def resolve_node(name: str) -> Optional[str]:
+            if not name:
+                return None
+            sid = _safe_id(name)
+            if sid in nodes:
+                return sid
+            # try matching by title (case-insensitive)
+            for nid, meta in nodes.items():
+                if meta["title"].strip().lower() == str(name).strip().lower():
+                    return nid
+            # not found
+            return None
 
-        # Add flows. Resolve names to node ids if possible.
+        # add flows (create nodes if referenced but not present)
         for f in flows:
             src_raw = f.get("from") or ""
             dst_raw = f.get("to") or ""
             lbl = _sanitize_label(f.get("label") or "", max_len=80)
 
-            src_id = _safe_id(src_raw)
-            dst_id = _safe_id(dst_raw)
-            # try to pick canonical id from actual components list if titles used
-            if src_id not in created:
-                # maybe src_raw equals a component title
-                for c in comps_list:
-                    if _sanitize_label(c.get("title") or "").lower() == src_raw.strip().lower():
-                        src_id = _safe_id(c.get("id") or c.get("title"))
-                        break
-            if dst_id not in created:
-                for c in comps_list:
-                    if _sanitize_label(c.get("title") or "").lower() == dst_raw.strip().lower():
-                        dst_id = _safe_id(c.get("id") or c.get("title"))
-                        break
+            src = resolve_node(src_raw) or _safe_id(src_raw)
+            dst = resolve_node(dst_raw) or _safe_id(dst_raw)
 
-            if not src_id or not dst_id:
-                continue
-            # final safe ids
-            src_id = _safe_id(src_id)
-            dst_id = _safe_id(dst_id)
+            # create node if missing
+            if src not in nodes:
+                nodes[src] = {"title": _sanitize_label(src_raw), "type": "process", "desc": ""}
+                dot.node(src, label=_sanitize_label(src_raw), shape="box", style="rounded,filled", fillcolor="#ffffff")
+            if dst not in nodes:
+                nodes[dst] = {"title": _sanitize_label(dst_raw), "type": "process", "desc": ""}
+                dot.node(dst, label=_sanitize_label(dst_raw), shape="box", style="rounded,filled", fillcolor="#ffffff")
 
-            # Add edge with label (if provided)
             if lbl:
-                dot.edge(src_id, dst_id, label=lbl, fontsize="9", color="#2b7cff", fontname="Arial")
+                dot.edge(src, dst, label=lbl, fontsize="9", color="#2b7cff", fontname="Arial")
             else:
-                dot.edge(src_id, dst_id, color="#2b7cff")
+                dot.edge(src, dst, color="#2b7cff")
 
         try:
             png = dot.pipe(format="png")
-            return png
+            if png:
+                return png
         except Exception as e:
             logger.exception("Graphviz pipe failed for dataflow diagram: %s", e)
     except Exception as e:
@@ -442,17 +434,7 @@ def generate_dataflow_diagram(proposal: Dict[str, Any], width: int = 1400) -> by
 
 def generate_deployment_diagram(proposal: Dict[str, Any], width: int = 1400) -> bytes:
     """
-    Professional Deployment Diagram.
-    Style based on standard UML deployment diagrams (Visual Paradigm):
-    - physical nodes / environments are clusters (boxes with label)
-    - components/artifacts appear inside the cluster
-    - dotted lines indicate 'deployed on' relationships
-    - arrows between nodes show network / communication
-
-    Input:
-      proposal['infrastructure'] = list of infra nodes (node/id, label, type)
-      proposal['components'] = list of components with optional 'host' field pointing to infra node id/label
-      proposal['connections'] = list of dicts {from: infra_id/label, to: infra_id/label, label: 'https/api'}
+    Deployment diagram with infra clusters and components deployed into them.
     """
     try:
         infra = _normalize_infra(proposal.get("infrastructure") if isinstance(proposal, dict) else None)
@@ -463,113 +445,127 @@ def generate_deployment_diagram(proposal: Dict[str, Any], width: int = 1400) -> 
         dot.attr("graph", rankdir="LR", fontsize="10", fontname="Arial")
         dot.attr("node", fontname="Arial")
 
-        # create infra clusters
-        infra_map = {}
+        infra_map = {}  # host_safe_id -> original infra dict + label
+        used_ids = set()
+
+        # create infra clusters and representative infra nodes
         for i, inf in enumerate(infra):
-            node_key = str(inf.get("node") or f"infra_{i}")
-            node_id = _safe_id(node_key)
-            infra_label = _sanitize_label(inf.get("label") or node_key, max_len=120)
-            infra_map[node_id] = {"orig": inf, "label": infra_label}
-            with dot.subgraph(name=f"cluster_{node_id}") as c:
-                c.attr(label=infra_label)
-                c.attr(style="rounded", color="#cfe3ff", fontsize="10")
-                # add a placeholder node representing the node box (invisible border)
-                # components will be placed into cluster by giving them the same name
-                # but Graphviz places nodes inside subgraph automatically
-                # nothing to add here yet
+            orig_node = str(inf.get("node") or f"infra_{i}")
+            node_safe = _safe_id(orig_node)
+            base = node_safe
+            suffix = 1
+            while node_safe in used_ids:
+                node_safe = f"{base}_{suffix}"
+                suffix += 1
+            used_ids.add(node_safe)
+            infra_label = _sanitize_label(inf.get("label") or orig_node, max_len=120)
+            infra_map[node_safe] = {"orig": inf, "label": infra_label}
+            # create a cluster and an infra node inside it
+            with dot.subgraph(name=f"cluster_{node_safe}") as c:
+                c.attr(label=infra_label, style="rounded", color="#cfe3ff", fontsize="10")
+                infra_node_id = f"infra_node_{node_safe}"
+                c.node(infra_node_id, label=infra_label, shape="oval", style="filled", fillcolor="#e6f0ff", fontsize="10")
+                # we keep infra_node_id placeholder for edges
 
-        # add components, placing them under their host cluster (Graphviz will visually place nodes inside cluster)
-        for comp in comps:
-            cid = _safe_id(comp.get("id") or comp.get("title") or f"comp_{len(comp)}")
-            title = _sanitize_label(comp.get("title") or cid, max_len=140)
-            desc = _sanitize_label(comp.get("description") or "", max_len=160)
+        # helper: find infra cluster id by host string
+        def find_infra_host(host_value: str) -> Optional[str]:
+            if not host_value:
+                return None
+            maybe = _safe_id(host_value)
+            if maybe in infra_map:
+                return maybe
+            # try match by label
+            for k, v in infra_map.items():
+                if v["label"].strip().lower() == str(host_value).strip().lower():
+                    return k
+            return None
+
+        # add components, placing them inside their host cluster if possible
+        comp_nodes_created = set()
+        for c in comps:
+            orig = str(c.get("id") or c.get("title") or "")
+            comp_safe = _safe_id(orig)
+            base = comp_safe
+            suffix = 1
+            while comp_safe in used_ids:
+                comp_safe = f"{base}_{suffix}"
+                suffix += 1
+            used_ids.add(comp_safe)
+
+            title = _sanitize_label(c.get("title") or orig, max_len=140)
+            desc = _sanitize_label(c.get("description") or "", max_len=140)
             label = title if not desc else f"{title}\\n{desc}"
-            host = comp.get("host") or comp.get("node") or None
-            host_id = None
-            if host:
-                # try to match host to infra
-                hid = _safe_id(host)
-                if hid in infra_map:
-                    host_id = hid
-                else:
-                    # try match by label text
-                    for k, v in infra_map.items():
-                        if v['label'].lower() == str(host).strip().lower():
-                            host_id = k
-                            break
+            host = c.get("host") or c.get("node") or None
+            host_id = find_infra_host(host) if host else None
 
-            # create node (Graphviz will render it inside the cluster if we used subgraph earlier)
-            dot.node(cid, label=label, shape="box", style="filled", fillcolor="#ffffff", fontsize="9")
-            # if host found, draw dashed line from infra box to component with label 'deployed'
             if host_id:
-                dot.edge(f"infra_{host_id}", cid, style="dashed", label="deployed", color="#666666", fontsize="8")
+                # create node inside cluster
+                with dot.subgraph(name=f"cluster_{host_id}") as sc:
+                    sc.node(comp_safe, label=label, shape="box", style="filled", fillcolor="#ffffff", fontsize="9")
             else:
-                # no explicit host - leave as floating or create edge to a generic infra cluster
-                pass
+                dot.node(comp_safe, label=label, shape="box", style="filled", fillcolor="#ffffff", fontsize="9")
 
-        # create network / infra connections
-        for conn in _ensure_list(connections):
+            comp_nodes_created.add(comp_safe)
+            # if host exists, draw dashed 'deployed' edge between infra_node and comp
+            if host_id:
+                left = f"infra_node_{host_id}"
+                dot.edge(left, comp_safe, style="dashed", label="deployed", color="#666666", fontsize="8")
+
+        # add network / infra connections
+        for conn in connections:
             try:
                 if isinstance(conn, dict):
-                    left = _safe_id(conn.get("from") or conn.get("src") or "")
-                    right = _safe_id(conn.get("to") or conn.get("dst") or "")
+                    left_raw = conn.get("from") or conn.get("src") or ""
+                    right_raw = conn.get("to") or conn.get("dst") or ""
                     lbl = _sanitize_label(conn.get("label") or "", max_len=80)
                 elif isinstance(conn, str):
-                    # parse simple "A->B: label"
                     s = conn
                     if "->" in s:
                         a, b = s.split("->", 1)
                         if ":" in b:
                             to_part, lbl = b.split(":", 1)
-                            left = _safe_id(a)
-                            right = _safe_id(to_part)
+                            left_raw = a.strip()
+                            right_raw = to_part.strip()
                             lbl = _sanitize_label(lbl)
                         else:
-                            left = _safe_id(a)
-                            right = _safe_id(b)
+                            left_raw = a.strip()
+                            right_raw = b.strip()
                             lbl = ""
                     else:
                         continue
                 else:
                     continue
-                if left and right:
-                    if lbl:
-                        dot.edge(left, right, label=lbl, color="#2b7cff")
-                    else:
-                        dot.edge(left, right, color="#2b7cff")
+                left_id = find_infra_host(left_raw) or _safe_id(left_raw)
+                right_id = find_infra_host(right_raw) or _safe_id(right_raw)
+                left_node = f"infra_node_{left_id}"
+                right_node = f"infra_node_{right_id}"
+                if lbl:
+                    dot.edge(left_node, right_node, label=lbl, color="#2b7cff")
+                else:
+                    dot.edge(left_node, right_node, color="#2b7cff")
             except Exception:
                 continue
 
-        # If no infra clusters existed, add a top-level "Deployment" node grouping
-        if not infra_map:
-            # simply create a dotted box grouping all components (visual hint)
-            # but Graphviz doesn't have a native group box outside of clusters; skip
-            pass
-
         try:
             png = dot.pipe(format="png")
-            return png
+            if png:
+                return png
         except Exception as e:
             logger.exception("Graphviz pipe failed for deployment diagram: %s", e)
     except Exception as e:
         logger.exception("Deployment diagram generation failed: %s", e)
 
     return _placeholder_png_bytes("Deployment diagram failed")
+
+
 def generate_gantt_image(proposal: Dict[str, Any], width: int = 1400) -> bytes:
-    """
-    Professional Gantt chart via Plotly.
-    Expects proposal['milestones'] or proposal['phases_list'] as list of dicts:
-      {name, start (ISO), end (ISO) or duration_days, percent_complete, owner}
-    """
     try:
         ms = _normalize_milestones(proposal.get("milestones") or proposal.get("phases_list") or [])
         rows = []
         today = datetime.date.today()
 
-        # build rows with Start/Finish datetimes
         for i, m in enumerate(ms):
             name = m.get("name") or f"Phase {i+1}"
-            # parse start/end into datetimes
             start_dt = _to_datetime(m.get("start"))
             end_dt = _to_datetime(m.get("end"))
             dur = None
@@ -578,7 +574,6 @@ def generate_gantt_image(proposal: Dict[str, Any], width: int = 1400) -> bytes:
                     dur = int(m.get("duration_days"))
                 except Exception:
                     dur = None
-            # fallback, try duration_weeks
             if dur is None and m.get("duration_weeks") is not None:
                 try:
                     dur = int(m.get("duration_weeks")) * 7
@@ -586,7 +581,6 @@ def generate_gantt_image(proposal: Dict[str, Any], width: int = 1400) -> bytes:
                     dur = None
 
             if start_dt is None and end_dt is None:
-                # place sequentially starting from today
                 start_dt = datetime.datetime.combine(today + datetime.timedelta(days=i * 14), datetime.time.min)
                 end_dt = start_dt + datetime.timedelta(days=dur or 14)
             elif start_dt is None and end_dt is not None:
@@ -595,13 +589,11 @@ def generate_gantt_image(proposal: Dict[str, Any], width: int = 1400) -> bytes:
             elif start_dt is not None and end_dt is None:
                 end_dt = start_dt + datetime.timedelta(days=dur or 14)
 
-            # ensure datetimes
             if not isinstance(start_dt, datetime.datetime):
                 start_dt = _to_datetime(start_dt)
             if not isinstance(end_dt, datetime.datetime):
                 end_dt = _to_datetime(end_dt)
             if start_dt is None or end_dt is None:
-                # fallback short window
                 start_dt = datetime.datetime.combine(today + datetime.timedelta(days=i * 14), datetime.time.min)
                 end_dt = start_dt + datetime.timedelta(days=14)
 
@@ -620,7 +612,6 @@ def generate_gantt_image(proposal: Dict[str, Any], width: int = 1400) -> bytes:
             })
 
         if not rows:
-            # synthesize small default timeline
             for i in range(3):
                 s = datetime.datetime.combine(today + datetime.timedelta(days=i * 14), datetime.time.min)
                 f = s + datetime.timedelta(days=14)
@@ -630,7 +621,6 @@ def generate_gantt_image(proposal: Dict[str, Any], width: int = 1400) -> bytes:
         df["Start"] = pd.to_datetime(df["Start"])
         df["Finish"] = pd.to_datetime(df["Finish"])
 
-        # prepare figure
         fig = px.timeline(df, x_start="Start", x_end="Finish", y="Task", title="Project Timeline")
         fig.update_yaxes(autorange="reversed")
         fig.update_traces(marker=dict(line=dict(width=0)))
@@ -641,12 +631,12 @@ def generate_gantt_image(proposal: Dict[str, Any], width: int = 1400) -> bytes:
             showlegend=False,
             font=dict(family="Arial")
         )
-        # color bars by Percent manually: draw rect shapes per row
+
+        # colored bars by percent: use shapes to avoid modifying trace internals
         for idx, row in df.reset_index(drop=True).iterrows():
             start = row["Start"].to_pydatetime()
             finish = row["Finish"].to_pydatetime()
             pct = float(row["Percent"])
-            # color interpolation: red->yellow->green
             if pct < 50.0:
                 r = 255
                 g = int(255 * (pct / 50.0))
@@ -654,18 +644,15 @@ def generate_gantt_image(proposal: Dict[str, Any], width: int = 1400) -> bytes:
                 g = 255
                 r = int(255 * (1 - ((pct - 50.0) / 50.0)))
             color = f"rgba({r},{g},0,0.9)"
-            # y as index position
             fig.add_shape(type="rect",
                           x0=start, x1=finish,
                           y0=idx - 0.4, y1=idx + 0.4,
                           xref="x", yref="y",
                           fillcolor=color, line=dict(width=0))
-            # percent label centered
             mid = start + (finish - start) / 2
             fig.add_annotation(x=mid, y=idx, xref="x", yref="y",
                                text=f"{int(pct)}%", showarrow=False, font=dict(size=10, color="black"))
 
-        # Today marker (paper coordinates to avoid axis type issues)
         try:
             today_dt = pd.to_datetime(datetime.date.today()).to_pydatetime()
             fig.add_shape(type="line", x0=today_dt, x1=today_dt, y0=0, y1=1, xref="x", yref="paper",
@@ -675,11 +662,9 @@ def generate_gantt_image(proposal: Dict[str, Any], width: int = 1400) -> bytes:
         except Exception as e:
             logger.debug("Could not add Today marker: %s", e)
 
-        # small legend as annotation
         fig.add_annotation(xref="paper", yref="paper", x=0.99, y=0.01,
                            text="Legend: color = % complete", showarrow=False, align="right", font=dict(size=9))
 
-        # export PNG via kaleido
         try:
             png = pio.to_image(fig, format="png", width=width, height=max(320, 60 * len(df) + 80), scale=2)
             if png:

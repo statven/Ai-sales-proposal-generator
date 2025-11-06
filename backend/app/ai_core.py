@@ -277,27 +277,74 @@ async def generate_ai_sections(proposal: dict, tone: str = "Formal") -> dict:
 
 
 
-async def process_ai_content(proposal: Dict[str, Any], tone: str = "Formal") -> Tuple[Dict[str, str], str]:
+
+async def process_ai_content(proposal: Dict[str, Any], tone: str = "Formal") -> Tuple[Dict[str, Any], str]:
     """
-    Тонкая обертка-оркестратор.
-      - Вызывает generate_ai_sections
-      - Возвращает (sections_dict, used_model_string)
+    Возвращаем (sections_dict, used_model_string)
+    sections_dict теперь содержит:
+      - textual fields (executive_summary_text, ...)
+      - suggested_deliverables, suggested_phases
+      - visualization (components,infrastructure,data_flows,connections,milestones)
     """
-    used_model = os.getenv("OPENAI_MODEL") or "openai" # По умолчанию
-    
+    used_model = os.getenv("OPENAI_MODEL") or "openai"
+    raw_response = ""
     try:
-        sections = await generate_ai_sections(proposal, tone)
-        
-        # (FIX 13: Тестируем эту ветку)
-        # Если модель не определена в sections, используем env var
-        # Если она определена (например, _used_model из openai_service), она будет в sections
-        if "used_model" in sections:
-            used_model = str(sections.get("used_model", used_model))
-        
-        return sections, used_model
-        
+        # вызвать основную sync функцию в to_thread
+        res = await asyncio.to_thread(generate_ai_json, proposal, tone)
+        if isinstance(res, bytes):
+            try:
+                raw_response = res.decode("utf-8", errors="ignore")
+            except Exception:
+                raw_response = str(res)
+        else:
+            raw_response = str(res or "")
     except Exception as e:
-        # (FIX 14: Тестируем эту ветку, мокая generate_ai_sections с side_effect=Exception)
-        logger.exception("process_ai_content: AI generation failed unexpectedly: %s", e)
+        logger.exception("AI call failed: %s", e)
+        raw_response = ""
+
+    # Try to parse JSON blob
+    parsed = None
+    # быстрый парсинг
+    try:
+        parsed = json.loads(raw_response)
+    except Exception:
+        # попытаемся извлечь первый {...} из текста
+        blob = _extract_json_blob(raw_response) if "{" in raw_response else ""
+        if blob:
+            try:
+                parsed = json.loads(blob)
+            except Exception:
+                parsed = None
+
+    if not parsed or not isinstance(parsed, dict):
+        # fallback: safe sections
         safe = await generate_ai_sections_safe(proposal)
-        return safe, "fallback_safe"
+        # attach empty suggestions/visualization
+        safe.update({
+            "suggested_deliverables": [],
+            "suggested_phases": [],
+            "visualization": {"components": [], "infrastructure": [], "data_flows": [], "connections": [], "milestones": []}
+        })
+        return safe, used_model
+
+    # Normalize: ensure keys exist and types correct
+    out = {}
+    textual_keys = ["executive_summary_text","project_mission_text","solution_concept_text","project_methodology_text",
+                    "financial_justification_text","payment_terms_text","development_note","licenses_note","support_note"]
+    for k in textual_keys:
+        out[k] = parsed.get(k) if parsed.get(k) is not None else ""
+    # suggestions
+    out["suggested_deliverables"] = parsed.get("suggested_deliverables") if isinstance(parsed.get("suggested_deliverables"), list) else []
+    out["suggested_phases"] = parsed.get("suggested_phases") if isinstance(parsed.get("suggested_phases"), list) else []
+    # visualization
+    viz = parsed.get("visualization") if isinstance(parsed.get("visualization"), dict) else {}
+    # ensure viz has expected subkeys
+    out["visualization"] = {
+        "components": viz.get("components") if isinstance(viz.get("components"), list) else [],
+        "infrastructure": viz.get("infrastructure") if isinstance(viz.get("infrastructure"), list) else [],
+        "data_flows": viz.get("data_flows") if isinstance(viz.get("data_flows"), list) else [],
+        "connections": viz.get("connections") if isinstance(viz.get("connections"), list) else [],
+        "milestones": viz.get("milestones") if isinstance(viz.get("milestones"), list) else []
+    }
+    # Also include textual keys to be used by doc_engine
+    return out, used_model

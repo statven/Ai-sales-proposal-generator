@@ -43,7 +43,7 @@ logger = logging.getLogger("uvicorn.error")
 # --- ENV / configuration ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # FIX 1: Используем JSON-совместимую модель по умолчанию
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo-0125") 
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.3-turbo-0125") 
 OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", OPENAI_MODEL)
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "2048"))
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.3"))
@@ -70,34 +70,40 @@ def _prompt_hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def _build_prompt(proposal: Dict[str, Any], tone: str = "Formal") -> str:
-    # accept both client_name and client_company_name (frontend uses client_company_name)
-    client = proposal.get("client_name") or proposal.get("client_company_name") or ""
-    provider = proposal.get("provider_name") or proposal.get("provider_company_name") or ""
+    """Prompt asking for full JSON: textual sections, suggestions, visualization structure."""
+    client = proposal.get("client_company_name") or proposal.get("client_name") or ""
+    provider = proposal.get("provider_company_name") or proposal.get("provider_name") or ""
     project_goal = proposal.get("project_goal", "")
     scope = proposal.get("scope", "")
     technologies = proposal.get("technologies") or []
     techs = ", ".join(technologies) if isinstance(technologies, (list, tuple)) else str(technologies)
     deadline = proposal.get("deadline", "")
 
-    tone_instruction = {
-        "Formal": "Use a formal, professional tone focused on clarity and precision.",
-        "Marketing": "Write in a persuasive, benefit-focused marketing tone (highlight outcomes).",
-        "Technical": "Write in a detailed technical tone focusing on architecture and acceptance criteria.",
-        "Friendly": "Write in a friendly, conversational tone.",
-    }.get(tone, "Use a neutral and professional tone.")
-
     prompt = f"""
-You are an expert commercial proposal writer. RETURN EXACTLY ONE VALID JSON OBJECT AND NOTHING ELSE — no commentary, no markdown.
-The JSON must contain exactly these keys (strings):
-executive_summary_text, project_mission_text, solution_concept_text,
-project_methodology_text, financial_justification_text, payment_terms_text,
-development_note, licenses_note, support_note
+You are an expert commercial proposal writer AND a systems architect / delivery manager.
+Return EXACTLY ONE VALID JSON OBJECT and NOTHING ELSE. The JSON must have the following keys:
 
-Optional (helpful for visuals):
-components: optional list of objects with fields {{id, title, description, depends_on: [ids]}}
-milestones: optional list of objects with fields {{name, start (YYYY-MM-DD or null), end (YYYY-MM-DD or null), duration_days (int optional)}}
+- executive_summary_text (string)
+- project_mission_text (string)
+- solution_concept_text (string)
+- project_methodology_text (string)
+- financial_justification_text (string)
+- payment_terms_text (string)
+- development_note (string)
+- licenses_note (string)
+- support_note (string)
 
-Input:
+- suggested_deliverables: array of objects {{ "title","description","acceptance" }}
+- suggested_phases: array of objects {{ "phase_name","duration_weeks","tasks" }}
+
+- visualization: object containing:
+    components: [{{id, title, description, type (service|db|ui|other), depends_on: [ids]}}]
+    infrastructure: [{{node, label}}]
+    data_flows: [{{from, to, label}}]    # logical flows (DFD style)
+    connections: [{{from, to, label}}]   # infra-level network links
+    milestones: [{{name, start (YYYY-MM-DD|null), end (YYYY-MM-DD|null), duration_days (int|null)}}]
+
+Input brief:
 client_name: "{client}"
 provider_name: "{provider}"
 project_goal: "{project_goal}"
@@ -106,29 +112,15 @@ technologies: "{techs}"
 deadline: "{deadline}"
 tone: "{tone}"
 
-Instruction:
-{tone_instruction}
-For each required field: write 3-6 concise sentences. If you cannot determine a field, set it to an empty string "".
-Do NOT include extra keys except the optional 'components' and 'milestones' as described above.
+Guidelines:
+- For the textual fields: write concise, professional sentences (2-6 sentences each).
+- For suggested_deliverables and suggested_phases: be concrete and numbered (realistic durations).
+- For visualization: produce a concrete list of components, infra nodes, data flows and milestones so diagrams can be built automatically.
+- Use ISO dates YYYY-MM-DD for start/end where possible; if unknown, set start or end to null.
+- Do NOT include any keys besides the ones listed above.
+- Return only valid JSON. If unsure, include empty arrays or nulls rather than free text.
 
-EXACT JSON EXAMPLE:
-{{
-"executive_summary_text": "Short summary...",
-"project_mission_text": "Mission ...",
-"solution_concept_text": "Solution ...",
-"project_methodology_text": "Methodology ...",
-"financial_justification_text": "Why investment ...",
-"payment_terms_text": "Payment schedule ...",
-"development_note": "What development covers ...",
-"licenses_note": "Licenses included ...",
-"support_note": "Support and SLA ...",
-"components": [
-    {{"id":"API","title":"API","description":"REST API","depends_on":["DB"]}}
-],
-"milestones": [
-    {{"name":"Discovery","start":"2025-11-01","end":"2025-11-14","duration_days":14}}
-]
-}}
+Produce JSON only.
 """
     return prompt.strip()
 
@@ -314,86 +306,85 @@ def _call_gemini(prompt_str: str) -> Tuple[str, str]:
 
 # ------------- public entrypoint (AI sections) -------------
 def generate_ai_json(proposal: Dict[str, Any], tone: str = "Formal") -> str:
-    """
-    Returns model text or JSON string. Tries:
-    1) cached new OpenAI client
-    2) live OpenAI new client (retries)
-    3) Gemini (Google AI) fallback
-    4) deterministic stub
-    Always returns a str (never None).
-    """
     if OPENAI_USE_STUB:
-        client_name = proposal.get("client_name", "Client")
+        # create a deterministic stub compatible with schema (minimal)
+        client = proposal.get("client_company_name", "Client")
         stub = {
-            "executive_summary_text": f"This is a fallback executive summary for {client_name}.",
-            "project_mission_text": "Deliver a reliable, maintainable solution that provides measurable business value.",
-            "solution_concept_text": "We propose a pragmatic architecture using modular services and reliable third-party platforms.",
-            "project_methodology_text": "Agile with two-week sprints, CI/CD, testing and demos.",
-            "financial_justification_text": "Expected benefits and efficiency gains justify the investment.",
-            "payment_terms_text": "50% upfront, 50% on delivery. Proposal valid for 30 days.",
-            "development_note": "Includes development, QA, and DevOps efforts.",
-            "licenses_note": "Includes typical SaaS licenses and hosting.",
-            "support_note": "Includes 3 months of post-launch support."
+            "executive_summary_text": f"Fallback executive summary for {client}.",
+            "project_mission_text": "Deliver a reliable solution.",
+            "solution_concept_text": "Modular microservices architecture.",
+            "project_methodology_text": "Agile with 2-week sprints.",
+            "financial_justification_text": "ROI and efficiency gained.",
+            "payment_terms_text": "50% upfront, 50% on delivery.",
+            "development_note": "Covers development and QA.",
+            "licenses_note": "Typical SaaS licenses.",
+            "support_note": "3 months of post-launch support.",
+            "suggested_deliverables": [],
+            "suggested_phases": [],
+            "visualization": {
+                "components": [],
+                "infrastructure": [],
+                "data_flows": [],
+                "connections": [],
+                "milestones": []
+            }
         }
         return json.dumps(stub, ensure_ascii=False)
 
-    prompt_str = _build_prompt(proposal, tone)
-    prompt_key = _prompt_hash(prompt_str + (tone or ""))
-
-    # try cached fast path (only uses new OpenAI client)
+    prompt = _build_prompt(proposal, tone)
+    # try cached fast path
     try:
-        cached = _invoke_openai_cached(prompt_str, OPENAI_MODEL)
+        cached = _invoke_openai_cached(prompt, OPENAI_MODEL)
         if cached:
-            logger.info("Cache hit for prompt %s model=%s", prompt_key, OPENAI_MODEL)
-            return cached
+            # try parse to be safe
+            try:
+                json.loads(cached)
+                return cached
+            except Exception:
+                # not strict JSON, still use it as text
+                return cached
     except Exception:
-        logger.debug("Cache check failed/miss; proceeding to live call", exc_info=True)
+        pass
 
-    last_reason = ""
     last_exc = None
-
     for attempt in range(1, OPENAI_RETRY_ATTEMPTS + 1):
         try:
-            logger.info("Attempting OpenAI new client call model=%s attempt=%d/%d", OPENAI_MODEL, attempt, OPENAI_RETRY_ATTEMPTS)
-            res = _call_openai_new_client(prompt_str, OPENAI_MODEL)
+            res = _call_openai_new_client(prompt, OPENAI_MODEL)
             if res:
                 return res
-            last_reason = "openai_empty"
-            logger.warning("OpenAI returned empty on attempt %d", attempt)
+            last_exc = RuntimeError("empty response")
         except Exception as e:
             last_exc = e
-            last_reason = f"{type(e).__name__}:{e}"
-            logger.exception("OpenAI new client error on attempt %d: %s", attempt, last_reason)
-            # If this is clearly a "no new client available" or instantiation problem, don't retry
-            if "openai.OpenAI client class not available" in str(e) or "Failed to instantiate openai.OpenAI client" in str(e):
+            # если ошибка связана с отсутствием модели — сразу fallback
+            if "model_not_found" in str(e).lower() or "does not exist" in str(e).lower():
+                logger.warning("OpenAI model not found (%s), switching to Gemini fallback", OPENAI_MODEL)
                 break
-        
-        if attempt < OPENAI_RETRY_ATTEMPTS:
-            backoff = OPENAI_RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
-            jitter = random.random() * (backoff * 0.5)
-            sleep_time = backoff + jitter
-            logger.debug("Sleeping %.2fs before retry...", sleep_time)
-            time.sleep(sleep_time)
+            if attempt < OPENAI_RETRY_ATTEMPTS:
+                backoff = OPENAI_RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                time.sleep(backoff + random.random() * 0.5)
+            continue
 
-    # OpenAI new-client failed -> try Gemini fallback
-    logger.info("OpenAI new-client attempts exhausted; trying Gemini fallback. reason=%s", last_reason)
-    gemini_text, gemini_reason = _call_gemini(prompt_str)
+
+    # Gemini fallback
+    gemini_text, gemini_reason = _call_gemini(prompt)
     if gemini_text:
-        logger.info("Gemini fallback succeeded: %s", gemini_reason)
         return gemini_text
 
-    logger.warning("Gemini fallback failed reason=%s; returning deterministic stub.", gemini_reason)
-    client_name = proposal.get("client_name", "Client")
+    # final stub
+    client = proposal.get("client_company_name", "Client")
     stub = {
-        "executive_summary_text": f"This is a fallback executive summary for {client_name}.",
-        "project_mission_text": "Deliver a reliable, maintainable solution that provides measurable business value.",
-        "solution_concept_text": "We propose a pragmatic architecture using modular services and reliable third-party platforms.",
-        "project_methodology_text": "Agile with two-week sprints, CI/CD, testing and demos.",
-        "financial_justification_text": "Expected benefits and efficiency gains justify the investment.",
-        "payment_terms_text": "50% upfront, 50% on delivery. Proposal valid for 30 days.",
-        "development_note": "Includes development, QA, and DevOps efforts.",
-        "licenses_note": "Includes typical SaaS licenses and hosting.",
-        "support_note": "Includes 3 months of post-launch support."
+        "executive_summary_text": f"Fallback executive summary for {client}.",
+        "project_mission_text": "Deliver a reliable solution.",
+        "solution_concept_text": "Modular microservices architecture.",
+        "project_methodology_text": "Agile with 2-week sprints.",
+        "financial_justification_text": "ROI and efficiency gained.",
+        "payment_terms_text": "50% upfront, 50% on delivery.",
+        "development_note": "Covers development and QA.",
+        "licenses_note": "Typical SaaS licenses.",
+        "support_note": "3 months of post-launch support.",
+        "suggested_deliverables": [],
+        "suggested_phases": [],
+        "visualization": {"components": [], "infrastructure": [], "data_flows": [], "connections": [], "milestones": []}
     }
     return json.dumps(stub, ensure_ascii=False)
 

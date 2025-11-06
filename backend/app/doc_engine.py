@@ -273,102 +273,50 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
 
     # 6. Diagrams generation and insertion
     try:
-        # build components if none provided
-        components = context.get("components")
-        if components is None:
-            components = []
-            for i, d in enumerate(context.get("deliverables_list", []) or []):
-                components.append({
-                    "id": f"deliv_{i+1}",
-                    "title": d.get("title",""),
-                    "description": d.get("description",""),
-                    "depends_on": []
-                })
+        # внутри render_docx_from_template (перед сохранением) — предполагаем, что mapping/context уже сформирован
+        viz = context.get("visualization") or {}
+        # If proposal may have keys top-level
+        if not viz:
+            # try fallback from top-level keys (backwards compatibility)
+            viz = {
+                "components": context.get("components") or context.get("deliverables_list") or [],
+                "infrastructure": context.get("infrastructure") or [],
+                "data_flows": context.get("data_flows") or [],
+                "connections": context.get("connections") or [],
+                "milestones": context.get("milestones") or context.get("phases_list") or []
+            }
 
-        # build milestones if none provided (keep existing logic)
-        milestones = context.get("milestones")
-        if milestones is None:
-            milestones = []
-            base_date = None
-            try:
-                if context.get("deadline"):
-                    base_date = datetime.date.fromisoformat(str(context["deadline"]))
-                elif context.get("proposal_date"):
-                    base_date = datetime.date.fromisoformat(str(context["proposal_date"]))
-            except Exception:
-                base_date = None
-            if base_date is None:
-                base_date = datetime.date.today()
-
-            cursor = base_date
-            for i, p in enumerate(context.get("phases_list", []) or []):
-                name = p.get("phase_name") or (p.get("tasks") or "")[:60] or f"Phase {i+1}"
-                dur_days = None
-                try:
-                    if p.get("duration_weeks") is not None:
-                        dur_days = int(p.get("duration_weeks")) * 7
-                    elif p.get("duration") is not None:
-                        dur_days = int(p.get("duration"))
-                    elif p.get("duration_days") is not None:
-                        dur_days = int(p.get("duration_days"))
-                except Exception:
-                    dur_days = None
-                if dur_days is None:
-                    dur_days = 7 * 2
-                start = cursor
-                end = start + datetime.timedelta(days=dur_days)
-                milestones.append({
-                    "name": name,
-                    "start": start.isoformat(),
-                    "end": end.isoformat(),
-                    "duration_days": dur_days
-                })
-                cursor = end + datetime.timedelta(days=1)
-
-        # prepare a proposal-like dict for visualization functions (they expect 'components', 'milestones', etc.)
-        vis_payload = {
-            "components": components,
-            "data_flows": context.get("data_flows", []),
-            "infrastructure": context.get("infrastructure", []),
-            "milestones": milestones,
-            "phases_list": context.get("phases_list", []),
-        }
-
-        # generate diagrams (each function should return PNG bytes)
-        uml_bytes = None
-        dataflow_bytes = None
-        deploy_bytes = None
-        gantt_bytes = None
+        # call safe generators
+        try:
+            comp_png = generate_component_diagram(viz)
+        except Exception:
+            comp_png = None
 
         try:
-            uml_bytes = generate_component_diagram(vis_payload)
-        except Exception as e:
-            logger.exception("Component diagram generation failed: %s", e)
+            df_png = generate_dataflow_diagram(viz)
+        except Exception:
+            df_png = None
 
         try:
-            dataflow_bytes = generate_dataflow_diagram(vis_payload)
-        except Exception as e:
-            logger.exception("Dataflow diagram generation failed: %s", e)
+            dep_png = generate_deployment_diagram(viz)
+        except Exception:
+            dep_png = None
 
         try:
-            deploy_bytes = generate_deployment_diagram(vis_payload)
-        except Exception as e:
-            logger.exception("Deployment diagram generation failed: %s", e)
+            gantt_png = generate_gantt_image(viz)
+        except Exception:
+            gantt_png = None
 
-        try:
-            gantt_bytes = generate_gantt_image(vis_payload)
-        except Exception as e:
-            logger.exception("Gantt generation failed: %s", e)
+        # insert into placeholders if found (using your _insert_image_with_caption helper)
+        if comp_png:
+            _insert_image_with_caption(doc, comp_png, "{{components_diagram}}", caption_text=f"Figure. System components for {mapping.get('client_company_name','')}", width_inches=6.5)
+        if df_png:
+            _insert_image_with_caption(doc, df_png, "{{dataflow_diagram}}", caption_text="Figure. Data flow diagram.", width_inches=6.5)
+        if dep_png:
+            _insert_image_with_caption(doc, dep_png, "{{deployment_diagram}}", caption_text="Figure. Deployment diagram.", width_inches=6.5)
+        if gantt_png:
+            _insert_image_with_caption(doc, gantt_png, "{{gantt_chart}}", caption_text="Figure. Project timeline.", width_inches=6.5)
 
-        # insert diagrams into placeholders if present; append at end if not found
-        if uml_bytes:
-            _insert_image_with_caption(doc, uml_bytes, "{{uml_diagram}}", caption_text=f"Figure. System architecture. Generated for {mapping.get('client_company_name','')}", width_inches=6.5)
-        if dataflow_bytes:
-            _insert_image_with_caption(doc, dataflow_bytes, "{{dataflow_diagram}}", caption_text="Figure. Data flow and integration points.", width_inches=6.5)
-        if deploy_bytes:
-            _insert_image_with_caption(doc, deploy_bytes, "{{deployment_diagram}}", caption_text="Figure. Deployment and hosting overview.", width_inches=6.5)
-        if gantt_bytes:
-            _insert_image_with_caption(doc, gantt_bytes, "{{gantt_chart}}", caption_text="Figure. Project timeline (Gantt).", width_inches=6.5)
 
     except Exception:
         logger.exception("Diagram generation/insert failed; continuing without diagrams.")
