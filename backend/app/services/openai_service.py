@@ -42,7 +42,8 @@ logger = logging.getLogger("uvicorn.error")
 
 # --- ENV / configuration ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.4-turbo")
+# FIX 1: Используем JSON-совместимую модель по умолчанию
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo-0125") 
 OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", OPENAI_MODEL)
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "1024"))
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.3"))
@@ -69,8 +70,9 @@ def _prompt_hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def _build_prompt(proposal: Dict[str, Any], tone: str = "Formal") -> str:
-    client = proposal.get("client_name", "")
-    provider = proposal.get("provider_name", "")
+    # accept both client_name and client_company_name (frontend uses client_company_name)
+    client = proposal.get("client_name") or proposal.get("client_company_name") or ""
+    provider = proposal.get("provider_name") or proposal.get("provider_company_name") or ""
     project_goal = proposal.get("project_goal", "")
     scope = proposal.get("scope", "")
     technologies = proposal.get("technologies") or []
@@ -87,9 +89,13 @@ def _build_prompt(proposal: Dict[str, Any], tone: str = "Formal") -> str:
     prompt = f"""
 You are an expert commercial proposal writer. RETURN EXACTLY ONE VALID JSON OBJECT AND NOTHING ELSE — no commentary, no markdown.
 The JSON must contain exactly these keys (strings):
-  executive_summary_text, project_mission_text, solution_concept_text,
-  project_methodology_text, financial_justification_text, payment_terms_text,
-  development_note, licenses_note, support_note
+executive_summary_text, project_mission_text, solution_concept_text,
+project_methodology_text, financial_justification_text, payment_terms_text,
+development_note, licenses_note, support_note
+
+Optional (helpful for visuals):
+components: optional list of objects with fields {{id, title, description, depends_on: [ids]}}
+milestones: optional list of objects with fields {{name, start (YYYY-MM-DD or null), end (YYYY-MM-DD or null), duration_days (int optional)}}
 
 Input:
 client_name: "{client}"
@@ -102,20 +108,26 @@ tone: "{tone}"
 
 Instruction:
 {tone_instruction}
-For each field: write 1-4 concise sentences. If you cannot determine a field, set it to an empty string "".
-Do NOT include extra keys.
+For each required field: write 1-4 concise sentences. If you cannot determine a field, set it to an empty string "".
+Do NOT include extra keys except the optional 'components' and 'milestones' as described above.
 
 EXACT JSON EXAMPLE:
 {{
-  "executive_summary_text": "Short summary...",
-  "project_mission_text": "Mission ...",
-  "solution_concept_text": "Solution ...",
-  "project_methodology_text": "Methodology ...",
-  "financial_justification_text": "Why investment ...",
-  "payment_terms_text": "Payment schedule ...",
-  "development_note": "What development covers ...",
-  "licenses_note": "Licenses included ...",
-  "support_note": "Support and SLA ..."
+"executive_summary_text": "Short summary...",
+"project_mission_text": "Mission ...",
+"solution_concept_text": "Solution ...",
+"project_methodology_text": "Methodology ...",
+"financial_justification_text": "Why investment ...",
+"payment_terms_text": "Payment schedule ...",
+"development_note": "What development covers ...",
+"licenses_note": "Licenses included ...",
+"support_note": "Support and SLA ...",
+"components": [
+    {{"id":"API","title":"API","description":"REST API","depends_on":["DB"]}}
+],
+"milestones": [
+    {{"name":"Discovery","start":"2025-11-01","end":"2025-11-14","duration_days":14}}
+]
 }}
 """
     return prompt.strip()
@@ -164,13 +176,14 @@ def _extract_text_from_openai_response(resp: Any) -> str:
     except Exception:
         return ""
 
-
+# Note: _extract_json_blob is not strictly needed for JSON Mode, but it was 
+# present in the original code snippet (though not fully included here). 
+# We rely on JSON Mode for clean output.
 
 # ------------- OpenAI: NEW client only -------------
 def _call_openai_new_client(prompt_str: str, model_name: str) -> str:
     """
     Use only new openai.OpenAI() client. If not available or fails, raise exception.
-    This intentionally avoids attempting legacy API paths that will raise APIRemovedInV1.
     """
     if openai is None:
         raise RuntimeError("openai package not installed")
@@ -205,6 +218,9 @@ def _call_openai_new_client(prompt_str: str, model_name: str) -> str:
 
     # call (try request_timeout first, fall back if TypeError)
     try:
+        # FIX 2: Добавляем response_format для активации JSON Mode
+        json_format = {"type": "json_object"} 
+        
         try:
             resp = create_fn(
                 model=model_name, 
@@ -212,9 +228,7 @@ def _call_openai_new_client(prompt_str: str, model_name: str) -> str:
                 max_tokens=OPENAI_MAX_TOKENS, 
                 temperature=OPENAI_TEMPERATURE, 
                 request_timeout=OPENAI_REQUEST_TIMEOUT,
-                # --- КЛЮЧЕВОЕ ДОБАВЛЕНИЕ ДЛЯ JSON MODE ---
-                response_format={"type": "json_object"} 
-                # ------------------------------------------
+                response_format=json_format # КЛЮЧЕВОЕ ДОБАВЛЕНИЕ
             )
         except TypeError:
             # Fallback (если request_timeout не поддерживается, 
@@ -224,9 +238,7 @@ def _call_openai_new_client(prompt_str: str, model_name: str) -> str:
                 messages=messages, 
                 max_tokens=OPENAI_MAX_TOKENS, 
                 temperature=OPENAI_TEMPERATURE,
-                # --- КЛЮЧЕВОЕ ДОБАВЛЕНИЕ ДЛЯ JSON MODE ---
-                response_format={"type": "json_object"}
-                # ------------------------------------------
+                response_format=json_format # КЛЮЧЕВОЕ ДОБАВЛЕНИЕ
             )
 
         text = _extract_text_from_openai_response(resp)
@@ -304,10 +316,10 @@ def _call_gemini(prompt_str: str) -> Tuple[str, str]:
 def generate_ai_json(proposal: Dict[str, Any], tone: str = "Formal") -> str:
     """
     Returns model text or JSON string. Tries:
-      1) cached new OpenAI client
-      2) live OpenAI new client (retries)
-      3) Gemini (Google AI) fallback
-      4) deterministic stub
+    1) cached new OpenAI client
+    2) live OpenAI new client (retries)
+    3) Gemini (Google AI) fallback
+    4) deterministic stub
     Always returns a str (never None).
     """
     if OPENAI_USE_STUB:
@@ -345,12 +357,6 @@ def generate_ai_json(proposal: Dict[str, Any], tone: str = "Formal") -> str:
             logger.info("Attempting OpenAI new client call model=%s attempt=%d/%d", OPENAI_MODEL, attempt, OPENAI_RETRY_ATTEMPTS)
             res = _call_openai_new_client(prompt_str, OPENAI_MODEL)
             if res:
-                # try to update cache
-                #try:
-                   # _invoke_openai_cached.cache_clear() # crude invalidation
-                  #  _invoke_openai_cached(prompt_str, OPENAI_MODEL) # re-populate
-                #except Exception:
-                   # pass
                 return res
             last_reason = "openai_empty"
             logger.warning("OpenAI returned empty on attempt %d", attempt)
@@ -427,22 +433,22 @@ tone: "{tone}"
 
 JSON schema to return (exactly this shape):
 {{
-  "suggested_deliverables": [
+"suggested_deliverables": [
     {{
-      "title": "<short title, max 8-10 words>",
-      "description": "<1-2 sentences describing the deliverable>",
-      "acceptance": "<acceptance criteria (1 sentence)>"
+    "title": "<short title, max 8-10 words>",
+    "description": "<1-2 sentences describing the deliverable>",
+    "acceptance": "<acceptance criteria (1 sentence)>"
     }}
     // repeat up to {max_deliverables}
-  ],
-  "suggested_phases": [
+],
+"suggested_phases": [
     {{
-      "phase_name": "<short name>",
-      "duration_weeks": <integer weeks>,
-      "tasks": "<short list or sentence of key tasks>"
+    "phase_name": "<short name>",
+    "duration_weeks": <integer weeks>,
+    "tasks": "<short list or sentence of key tasks>"
     }}
     // repeat up to {max_phases}
-  ]
+]
 }}
 
 Important:
@@ -475,13 +481,12 @@ def generate_suggestions(proposal: Dict[str, Any], tone: str = "Formal", max_del
         if cached:
             # cached is raw text; try parse JSON
             try:
-                blob = _extract_text_from_openai_response(cached) if isinstance(cached, (dict, object)) else cached
-                blob = blob if isinstance(blob, str) else str(blob)
-                #js = json.loads(_extract_json_blob(blob) or blob)
-                if isinstance(blob, dict):
+                blob = cached if isinstance(cached, str) else str(cached)
+                parsed = json.loads(blob)
+                if isinstance(parsed, dict):
                     return {
-                        "suggested_deliverables": blob.get("suggested_deliverables", []),
-                        "suggested_phases": blob.get("suggested_phases", [])
+                        "suggested_deliverables": parsed.get("suggested_deliverables", []),
+                        "suggested_phases": parsed.get("suggested_phases", [])
                     }
             except Exception:
                 pass
@@ -492,35 +497,25 @@ def generate_suggestions(proposal: Dict[str, Any], tone: str = "Formal", max_del
     last_exc = None
     for attempt in range(1, OPENAI_RETRY_ATTEMPTS + 1):
         try:
-            # prefer new client call if available
-             #try:
-                #txt = _call_openai_new_client(prompt, OPENAI_MODEL)
-             #except Exception:
-                # If new client not available, fall back to _invoke_openai_cached (which may call new client)
-            # prefer new client call if available
             txt = _call_openai_new_client(prompt, OPENAI_MODEL)
             
             if not txt:
                 last_exc = RuntimeError("empty response")
                 continue
                 
-            # try extract JSON blob
+            # try parse clean JSON
             json_blob = txt if isinstance(txt, str) else str(txt)
             parsed = None
-            if json_blob:
+            try:
                 parsed = json.loads(json_blob)
-            else:
-                try:
-                    parsed = json.loads(blob)
-                except Exception:
-                    parsed = None
+            except Exception:
+                parsed = None
 
             if isinstance(parsed, dict):
                 return {
                     "suggested_deliverables": parsed.get("suggested_deliverables", []),
                     "suggested_phases": parsed.get("suggested_phases", [])
                 }
-            # else: try to parse text response heuristically (not ideal)
             last_exc = RuntimeError("Parsed non-dict")
         except Exception as e:
             last_exc = e
@@ -535,15 +530,12 @@ def generate_suggestions(proposal: Dict[str, Any], tone: str = "Formal", max_del
         gemini_text, gemini_reason = _call_gemini(prompt)
         if gemini_text:
             try:
-                json_blob = gemini_text if isinstance(gemini_text, str) else str(gemini_text)
+                blob = gemini_text if isinstance(gemini_text, str) else str(gemini_text)
                 parsed = None
-                if json_blob:
-                    parsed = json.loads(json_blob)
-                else:
-                    try:
-                        parsed = json.loads(blob)
-                    except Exception:
-                        parsed = None
+                try:
+                    parsed = json.loads(blob)
+                except Exception:
+                    parsed = None
                 if isinstance(parsed, dict):
                     return {
                         "suggested_deliverables": parsed.get("suggested_deliverables", []),

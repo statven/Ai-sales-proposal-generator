@@ -1,7 +1,7 @@
 # backend/app/routes/visualization.py
 from fastapi import APIRouter, Response, HTTPException
 from pydantic import BaseModel
-from typing import Any, Dict
+from typing import Dict, Any
 import logging
 
 from backend.app.services.visualization_service import generate_uml_image, generate_gantt_image

@@ -14,6 +14,7 @@ except Exception:
 
 logger = logging.getLogger("uvicorn.error")
 
+
 EXPECTED_KEYS: List[str] = [
     "executive_summary_text",
     "project_mission_text",
@@ -24,9 +25,11 @@ EXPECTED_KEYS: List[str] = [
     "development_note",
     "licenses_note",
     "support_note",
-    "components",        # list/object describing system components
-    "milestones",        # list of milestones for Gantt
+    # new keys used for visualization
+    "components",
+    "milestones",
 ]
+
 
 
 # (FIX 1: Более надежный экстрактор JSON)
@@ -230,27 +233,26 @@ async def generate_ai_sections(proposal: dict, tone: str = "Formal") -> dict:
                 
         return None # Не удалось распарсить
 
-    def normalize_values(d: Dict[str, Any]) -> Dict[str, Any]:
-        """Гарантирует, что все значения являются безопасными строками/примитивами."""
-        out: Dict[str, Any] = {}
-        if not d:
-            return out
-            
-        for k, v in d.items():
-            if v is None:
-                out[k] = ""
-            # (FIX 10: Упрощаем, ожидаем только примитивы из JSON)
-            elif isinstance(v, (str, int, float, bool)):
+
+def normalize_values(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Гарантирует, что все значения являются безопасными строками/примитивами или сохраняет вложенные структуры."""
+    out: Dict[str, Any] = {}
+    if not d:
+        return out
+
+    for k, v in d.items():
+        if v is None:
+            out[k] = ""
+        elif isinstance(v, (str, int, float, bool)):
+            out[k] = v
+        else:
+            # Preserve structured data (lists/dicts) for components/milestones
+            if isinstance(v, (list, dict)):
                 out[k] = v
             else:
-                # Для списков/словарей (components, milestones) — сохраняем как есть,
-                # остальные сложные типы — стринифицируем.
-                if isinstance(v, (list, dict)):
-                    out[k] = v
-                else:
-                    out[k] = _safe_stringify(v)
+                out[k] = _safe_stringify(v)
+    return out
 
-        return out
 
     # 1) Вызываем модель (включает 3 retries)
     raw_response = ""

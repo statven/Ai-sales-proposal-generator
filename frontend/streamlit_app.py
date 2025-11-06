@@ -12,6 +12,9 @@ from datetime import date, datetime
 from typing import List, Dict, Any
 import locale
 
+from io import BytesIO
+
+
 # ---------------- Configuration ----------------
 API_BASE_DEFAULT = os.getenv("PROPOSAL_API_BASE", "http://localhost:8000")
 GENERATE_SUFFIX = "/api/v1/generate-proposal"
