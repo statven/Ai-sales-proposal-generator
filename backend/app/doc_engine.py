@@ -1,12 +1,16 @@
 import re
 import logging
 import locale
+import datetime
 from io import BytesIO
 from typing import Dict, Any, List, Optional
 from docx import Document
+from docx.oxml.ns import qn
 from docx.shared import Pt, Inches
 from docx.table import Table
 from backend.app.services.visualization_service import generate_uml_image, generate_gantt_image
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+from docx.shared import Pt
 logger = logging.getLogger(__name__)
 
 PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
@@ -137,34 +141,36 @@ def _find_table_by_headers(doc: Document, headers: List[str]) -> Optional[Table]
 
 def _append_deliverables(table: Table, deliverables: List[Dict[str, str]], max_rows: int = 200):
     """
-    Добавляет строки с Deliverables.
-    Ожидаемые ключи в элементах: "title", "description", "acceptance".
+    Adds deliverables to the table. Accepts keys: "title", "description", "acceptance" OR "acceptance_criteria".
     """
     for d in deliverables[:max_rows]:
         try:
             row = table.add_row()
             cells = row.cells
             cells_count = len(cells)
-            
-            # Обеспечиваем, что при отсутствии ячеек 2 и 3 не будет IndexError
+
+            title = d.get("title", "") or ""
+            desc = d.get("description", "") or ""
+            # prefer acceptance_criteria (backend expected), but fallback to acceptance
+            acc = d.get("acceptance_criteria", d.get("acceptance", "")) or ""
+
             if cells_count >= 3:
-                cells[0].text = d.get("title", "")
-                cells[1].text = d.get("description", "")
-                cells[2].text = d.get("acceptance", "")
+                cells[0].text = title
+                cells[1].text = desc
+                cells[2].text = acc
             elif cells_count == 2:
-                 cells[0].text = d.get("title", "")
-                 cells[1].text = f"{d.get('description','')} / {d.get('acceptance','')}"
-            else: # cells_count == 1
-                cells[0].text = f"{d.get('title','')} - {d.get('description','')} - {d.get('acceptance','')}"
-                
+                cells[0].text = title
+                cells[1].text = f"{desc} / {acc}".strip(" /")
+            else:
+                cells[0].text = f"{title} - {desc} - {acc}"
         except Exception:
             logger.exception("Failed adding deliverable row; writing fallback")
             try:
-                # Резервная запись сырого представления
                 row = table.add_row()
                 row.cells[0].text = str(d)
             except Exception:
                 logger.exception("Even fallback write failed for deliverable row")
+
 
 def _append_timeline(table: Table, phases: List[Dict[str, str]], max_rows: int = 200):
     """
@@ -196,6 +202,50 @@ def _append_timeline(table: Table, phases: List[Dict[str, str]], max_rows: int =
             except Exception:
                 logger.exception("Even fallback write failed for timeline row")
 
+def _run_has_picture(run):
+    # xpath with namespace as second positional arg (not keywords)
+    try:
+        for r in run._element.xpath('.//pic:pic', {'pic': 'http://schemas.openxmlformats.org/drawingml/2006/picture'}):
+            return True
+    except Exception:
+        # fallback: check for drawing inline element
+        try:
+            if run._element.xpath('.//w:drawing'):
+                return True
+        except Exception:
+            pass
+    return False
+
+def _insert_image_with_caption(doc: Document, image_bytes: bytes, placeholder: str, caption_text: str = "", width_inches: float = 6.0):
+    inserted = _find_and_replace_placeholder_with_image(doc, placeholder, image_bytes, width_inches=width_inches)
+    if inserted:
+        # find the paragraph that contains the inserted image (search for runs that have a picture)
+        for idx, p in enumerate(doc.paragraphs):
+            for r in p.runs:
+                if _run_has_picture(r):
+                    # insert caption paragraph after this paragraph
+                    cap_para = doc.paragraphs[idx+1] if idx+1 < len(doc.paragraphs) else doc.add_paragraph()
+                    # if existing next paragraph is empty, use it; otherwise add new
+                    if cap_para.text.strip():
+                        cap_para = doc.add_paragraph()
+                    cap_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                    run = cap_para.add_run(caption_text)
+                    run.font.size = Pt(9)
+                    run.italic = True
+                    return True
+    else:
+        # append if placeholder was not found
+        p = doc.add_paragraph()
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        run = p.add_run()
+        run.add_picture(BytesIO(image_bytes), width=Inches(width_inches))
+        if caption_text:
+            cap_para = doc.add_paragraph(caption_text)
+            cap_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            cap_run = cap_para.runs[0]
+            cap_run.font.size = Pt(9)
+            cap_run.italic = True
+        return False
 
 def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> BytesIO:
     """
@@ -253,16 +303,51 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
                     "depends_on": []
                 })
 
+
+
         milestones = context.get("milestones")
         if milestones is None:
             milestones = []
+            # base date: prefer explicit deadline - duration sum, else proposal_date, else today
+            base_date = None
+            try:
+                if context.get("deadline"):
+                    # try to parse ISO date
+                    base_date = datetime.date.fromisoformat(str(context["deadline"]))
+                elif context.get("proposal_date"):
+                    base_date = datetime.date.fromisoformat(str(context["proposal_date"]))
+            except Exception:
+                base_date = None
+            if base_date is None:
+                base_date = datetime.date.today()
+
+            cursor = base_date
             for i, p in enumerate(context.get("phases_list", []) or []):
+                name = p.get("phase_name") or (p.get("tasks") or "")[:60] or f"Phase {i+1}"
+                # accept duration_weeks or duration_days or duration
+                dur_days = None
+                try:
+                    if p.get("duration_weeks") is not None:
+                        dur_days = int(p.get("duration_weeks")) * 7
+                    elif p.get("duration") is not None:
+                        dur_days = int(p.get("duration"))
+                    elif p.get("duration_days") is not None:
+                        dur_days = int(p.get("duration_days"))
+                except Exception:
+                    dur_days = None
+                if dur_days is None:
+                    dur_days = 7 * 2  # default 2 weeks
+
+                start = cursor
+                end = start + datetime.timedelta(days=dur_days)
                 milestones.append({
-                    "name": p.get("phase_name") or p.get("tasks", f"Phase {i+1}")[:30],
-                    "start": None,
-                    "end": None,
-                    "duration_days": int(p.get("duration", p.get("duration_weeks", 4))) * 7 if (p.get("duration") or p.get("duration_weeks")) else None
+                    "name": name,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "duration_days": dur_days
                 })
+                cursor = end + datetime.timedelta(days=1)
+
 
         # Generate images (these functions should return PNG bytes)
         uml_bytes = None
@@ -279,18 +364,9 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
 
         # Insert images into placeholders
         if uml_bytes:
-            inserted = _find_and_replace_placeholder_with_image(doc, "{{uml_diagram}}", uml_bytes, width_inches=6.0)
-            if not inserted:
-                # append at end if placeholder not found
-                p = doc.add_paragraph()
-                r = p.add_run()
-                r.add_picture(BytesIO(uml_bytes), width=Inches(6.0))
+            _insert_image_with_caption(doc, uml_bytes, "{{uml_diagram}}", caption_text=f"Figure. System architecture. Generated for {mapping.get('client_company_name','')}", width_inches=6.5)
         if gantt_bytes:
-            inserted = _find_and_replace_placeholder_with_image(doc, "{{gantt_chart}}", gantt_bytes, width_inches=6.0)
-            if not inserted:
-                p = doc.add_paragraph()
-                r = p.add_run()
-                r.add_picture(BytesIO(gantt_bytes), width=Inches(6.0))
+            _insert_image_with_caption(doc, gantt_bytes, "{{gantt_chart}}", caption_text=f"Figure. Project timeline (generated).", width_inches=6.5)
 
     except Exception:
         logger.exception("Diagram generation/insert failed; continuing without diagrams.")

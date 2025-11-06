@@ -26,8 +26,7 @@ except Exception as e:
     logger.warning("doc_engine not importable; DOCX generation disabled in this environment. Error: %s", e)
 
 try:
-    
-    from backend.app.routes.visualization import router as visualization_router
+    from backend.app.routes.visualization import router as visualization_route
 except Exception as e:
     # Если импорт не удался, doc_engine останется None
     logger.warning("visualization not importable; Error: %s", e)
@@ -104,7 +103,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(visualization_router)
+app.include_router(visualization_route)
 
 @app.on_event("startup")
 def _on_startup():

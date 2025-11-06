@@ -204,23 +204,22 @@ async def generate_ai_sections(proposal: dict, tone: str = "Formal") -> dict:
     """
     Надежная обертка для получения структурированных AI-секций.
     Стратегия:
-      1) Вызвать модель (которая внутри себя делает 3 попытки).
+      1) Вызвать модель (которая внутри себя делает retries).
       2) Попытаться извлечь JSON.
       3) Если не удалось -> вернуть generate_ai_sections_safe.
     """
-    
     def try_parse_string_to_dict(s: str) -> Optional[Dict[str, Any]]:
         """Пытается распарсить JSON из строки."""
         if not s or not isinstance(s, str):
             return None
-            
+
         blob = _extract_json_blob(s)
         if blob:
             try:
                 data = json.loads(blob)
                 return data if isinstance(data, dict) else None
             except json.JSONDecodeError:
-                pass # Пробуем распарсить всю строку
+                pass  # Пробуем распарсить всю строку
 
         # Fallback: пробуем распарсить всю строку, если она похожа на JSON
         s_stripped = s.strip()
@@ -230,37 +229,35 @@ async def generate_ai_sections(proposal: dict, tone: str = "Formal") -> dict:
                 return data if isinstance(data, dict) else None
             except json.JSONDecodeError:
                 pass
-                
-        return None # Не удалось распарсить
 
+        return None  # Не удалось распарсить
 
-def normalize_values(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Гарантирует, что все значения являются безопасными строками/примитивами или сохраняет вложенные структуры."""
-    out: Dict[str, Any] = {}
-    if not d:
-        return out
+    def normalize_values(d: Dict[str, Any]) -> Dict[str, Any]:
+        """Гарантирует, что все значения являются безопасными строками/примитивами или сохраняет вложенные структуры."""
+        out: Dict[str, Any] = {}
+        if not d:
+            return out
 
-    for k, v in d.items():
-        if v is None:
-            out[k] = ""
-        elif isinstance(v, (str, int, float, bool)):
-            out[k] = v
-        else:
-            # Preserve structured data (lists/dicts) for components/milestones
-            if isinstance(v, (list, dict)):
+        for k, v in d.items():
+            if v is None:
+                out[k] = ""
+            elif isinstance(v, (str, int, float, bool)):
                 out[k] = v
             else:
-                out[k] = _safe_stringify(v)
-    return out
+                # Preserve structured data (lists/dicts) for components/milestones
+                if isinstance(v, (list, dict)):
+                    out[k] = v
+                else:
+                    out[k] = _safe_stringify(v)
+        return out
 
-
-    # 1) Вызываем модель (включает 3 retries)
+    # 1) Вызываем модель (включает retries внутри _call_model_async)
     raw_response = ""
     try:
         raw_response = await _call_model_async(proposal, tone=tone)
     except Exception as e:
         logger.exception("AI call failed unexpectedly: %s", e)
-        raw_response = "" # Переходим к safe fallback
+        raw_response = ""  # Переходим к safe fallback
 
     # 2) Пытаемся распарсить
     parsed_json = try_parse_string_to_dict(raw_response)
@@ -271,11 +268,10 @@ def normalize_values(d: Dict[str, Any]) -> Dict[str, Any]:
     # 3) Не удалось распарсить -> используем safe fallback
     logger.warning("Failed to parse JSON from AI response. Returning safe fallback.")
     safe_sections = await generate_ai_sections_safe(proposal)
-    
-    # (FIX 11: Если AI вернул не-JSON, но полезный текст, 
-    # используем его как executive_summary_text)
-    if raw_response and len(raw_response) > 50: # (произвольный порог)
-         safe_sections["executive_summary_text"] = raw_response.strip()
+
+    # Если AI вернул не-JSON, но полезный текст, используем его как executive_summary_text
+    if raw_response and len(raw_response) > 50:  # порог можно настроить
+        safe_sections["executive_summary_text"] = raw_response.strip()
 
     return safe_sections
 
