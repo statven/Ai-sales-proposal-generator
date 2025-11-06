@@ -24,7 +24,10 @@ EXPECTED_KEYS: List[str] = [
     "development_note",
     "licenses_note",
     "support_note",
+    "components",        # list/object describing system components
+    "milestones",        # list of milestones for Gantt
 ]
+
 
 # (FIX 1: Более надежный экстрактор JSON)
 # backend/app/ai_core.py
@@ -194,12 +197,6 @@ async def _call_model_async(proposal: Dict[str, Any], tone: str = "Formal") -> s
         return "" # Возвращаем пустую строку, чтобы вызвать fallback
 
 
-# (FIX 9: Полностью переработанная и УПРОЩЕННАЯ generate_ai_sections)
-# Логика регенерации (которая не покрыта тестами) удалена.
-# openai_service УЖЕ выполняет 3 попытки (retries).
-# Если мы не можем распарсить ответ после 3 попыток, мы должны 
-# немедленно перейти к safe fallback, а не пытаться снова.
-
 async def generate_ai_sections(proposal: dict, tone: str = "Formal") -> dict:
     """
     Надежная обертка для получения структурированных AI-секций.
@@ -246,8 +243,13 @@ async def generate_ai_sections(proposal: dict, tone: str = "Formal") -> dict:
             elif isinstance(v, (str, int, float, bool)):
                 out[k] = v
             else:
-                # Если LLM вернул вложенный объект, безопасно его стрингифицируем
-                out[k] = _safe_stringify(v)
+                # Для списков/словарей (components, milestones) — сохраняем как есть,
+                # остальные сложные типы — стринифицируем.
+                if isinstance(v, (list, dict)):
+                    out[k] = v
+                else:
+                    out[k] = _safe_stringify(v)
+
         return out
 
     # 1) Вызываем модель (включает 3 retries)
@@ -276,7 +278,7 @@ async def generate_ai_sections(proposal: dict, tone: str = "Formal") -> dict:
     return safe_sections
 
 
-# (FIX 12: Упрощенный process_ai_content, удалена эвристика "fallback_safe")
+
 async def process_ai_content(proposal: Dict[str, Any], tone: str = "Formal") -> Tuple[Dict[str, str], str]:
     """
     Тонкая обертка-оркестратор.

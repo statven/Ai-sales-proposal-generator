@@ -4,7 +4,8 @@ import os
 import json
 import re
 from typing import Dict, Any, Optional
-from fastapi import FastAPI, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Body, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import ValidationError
 from datetime import datetime, date
@@ -13,7 +14,7 @@ from urllib.parse import quote
 import asyncio
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from fastapi.responses import Response
-from backend.app import observability
+
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -24,6 +25,19 @@ except Exception as e:
     # Если импорт не удался, doc_engine останется None
     logger.warning("doc_engine not importable; DOCX generation disabled in this environment. Error: %s", e)
 
+try:
+    from backend.app.routes.visualization import router as visualization_route
+except Exception as e:
+    # Если импорт не удался, doc_engine останется None
+    logger.warning("visualization not importable; Error: %s", e)
+
+# FIX: Делаем импорт 'observability' опциональным, как и другие сервисы.
+# Это предотвратит падение при отсутствии модуля observability.py.
+observability = None
+try:
+    from backend.app import observability
+except Exception as e:
+    logger.warning("Observability module failed to import. Continuing without it. Error: %s", e)
 
 
 try:
@@ -60,6 +74,8 @@ except Exception:
 
 # --- app init ---
 app = FastAPI(title="AI Sales Proposal Generator (Backend)")
+
+
 # Инициализация observability
 try:
     observability.setup_logging()
@@ -76,6 +92,16 @@ except Exception:
     # не ломаем приложение если observability не установлена/ошибка
     import logging
     logging.getLogger(__name__).warning("Observability init failed", exc_info=True)
+
+app.include_router(visualization_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # на проде конкретные домены
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.on_event("startup")
 def _on_startup():

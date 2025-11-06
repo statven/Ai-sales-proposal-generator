@@ -42,7 +42,7 @@ logger = logging.getLogger("uvicorn.error")
 
 # --- ENV / configuration ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.4-turbo")
 OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", OPENAI_MODEL)
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "1024"))
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.3"))
@@ -53,7 +53,7 @@ OPENAI_USE_STUB = os.getenv("OPENAI_USE_STUB", "0").lower() in ("1", "true", "ye
 
 # Gemini (Google AI) fallback
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash") # Используем быструю модель
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash") # Используем быструю модель
 
 # If module-level api_key attribute exists, set it for best-effort compatibility
 if openai is not None and OPENAI_API_KEY:
@@ -164,24 +164,7 @@ def _extract_text_from_openai_response(resp: Any) -> str:
     except Exception:
         return ""
 
-def _extract_json_blob(text: str) -> Optional[str]:
-    """
-    Find the first JSON object or array blob in a string.
-    """
-    if not text:
-        return None
-    
-    # Ищем первый { ... }
-    match_obj = re.search(r"\{.*\}", text, re.DOTALL)
-    if match_obj:
-        return match_obj.group(0)
-    
-    # Если не нашли, ищем [ ... ]
-    match_arr = re.search(r"\[.*\]", text, re.DOTALL)
-    if match_arr:
-        return match_arr.group(0)
-        
-    return None
+
 
 # ------------- OpenAI: NEW client only -------------
 def _call_openai_new_client(prompt_str: str, model_name: str) -> str:
@@ -223,10 +206,29 @@ def _call_openai_new_client(prompt_str: str, model_name: str) -> str:
     # call (try request_timeout first, fall back if TypeError)
     try:
         try:
-            resp = create_fn(model=model_name, messages=messages, max_tokens=OPENAI_MAX_TOKENS, temperature=OPENAI_TEMPERATURE, request_timeout=OPENAI_REQUEST_TIMEOUT)
+            resp = create_fn(
+                model=model_name, 
+                messages=messages, 
+                max_tokens=OPENAI_MAX_TOKENS, 
+                temperature=OPENAI_TEMPERATURE, 
+                request_timeout=OPENAI_REQUEST_TIMEOUT,
+                # --- КЛЮЧЕВОЕ ДОБАВЛЕНИЕ ДЛЯ JSON MODE ---
+                response_format={"type": "json_object"} 
+                # ------------------------------------------
+            )
         except TypeError:
-            resp = create_fn(model=model_name, messages=messages, max_tokens=OPENAI_MAX_TOKENS, temperature=OPENAI_TEMPERATURE)
-        
+            # Fallback (если request_timeout не поддерживается, 
+            # что маловероятно для новых клиентов)
+            resp = create_fn(
+                model=model_name, 
+                messages=messages, 
+                max_tokens=OPENAI_MAX_TOKENS, 
+                temperature=OPENAI_TEMPERATURE,
+                # --- КЛЮЧЕВОЕ ДОБАВЛЕНИЕ ДЛЯ JSON MODE ---
+                response_format={"type": "json_object"}
+                # ------------------------------------------
+            )
+
         text = _extract_text_from_openai_response(resp)
         logger.info("OpenAI new client returned result for model=%s", model_name)
         return text or ""
@@ -475,11 +477,11 @@ def generate_suggestions(proposal: Dict[str, Any], tone: str = "Formal", max_del
             try:
                 blob = _extract_text_from_openai_response(cached) if isinstance(cached, (dict, object)) else cached
                 blob = blob if isinstance(blob, str) else str(blob)
-                js = json.loads(_extract_json_blob(blob) or blob)
-                if isinstance(js, dict):
+                #js = json.loads(_extract_json_blob(blob) or blob)
+                if isinstance(blob, dict):
                     return {
-                        "suggested_deliverables": js.get("suggested_deliverables", []),
-                        "suggested_phases": js.get("suggested_phases", [])
+                        "suggested_deliverables": blob.get("suggested_deliverables", []),
+                        "suggested_phases": blob.get("suggested_phases", [])
                     }
             except Exception:
                 pass
@@ -503,8 +505,7 @@ def generate_suggestions(proposal: Dict[str, Any], tone: str = "Formal", max_del
                 continue
                 
             # try extract JSON blob
-            blob = txt if isinstance(txt, str) else str(txt)
-            json_blob = _extract_json_blob(blob)
+            json_blob = txt if isinstance(txt, str) else str(txt)
             parsed = None
             if json_blob:
                 parsed = json.loads(json_blob)
@@ -534,8 +535,7 @@ def generate_suggestions(proposal: Dict[str, Any], tone: str = "Formal", max_del
         gemini_text, gemini_reason = _call_gemini(prompt)
         if gemini_text:
             try:
-                blob = gemini_text if isinstance(gemini_text, str) else str(gemini_text)
-                json_blob = _extract_json_blob(blob)
+                json_blob = gemini_text if isinstance(gemini_text, str) else str(gemini_text)
                 parsed = None
                 if json_blob:
                     parsed = json.loads(json_blob)
