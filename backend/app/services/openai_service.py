@@ -45,7 +45,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # FIX 1: Используем JSON-совместимую модель по умолчанию
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo-0125") 
 OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", OPENAI_MODEL)
-OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "1024"))
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "2048"))
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.3"))
 OPENAI_REQUEST_TIMEOUT = int(os.getenv("OPENAI_REQUEST_TIMEOUT", "30"))
 OPENAI_RETRY_ATTEMPTS = int(os.getenv("OPENAI_RETRY_ATTEMPTS", "3"))
@@ -108,7 +108,7 @@ tone: "{tone}"
 
 Instruction:
 {tone_instruction}
-For each required field: write 1-4 concise sentences. If you cannot determine a field, set it to an empty string "".
+For each required field: write 3-6 concise sentences. If you cannot determine a field, set it to an empty string "".
 Do NOT include extra keys except the optional 'components' and 'milestones' as described above.
 
 EXACT JSON EXAMPLE:
@@ -401,10 +401,10 @@ def generate_ai_json(proposal: Dict[str, Any], tone: str = "Formal") -> str:
 # ----------------------------------------------
 # Suggestion generation: targeted prompts for deliverables/phases (returns dict)
 # ----------------------------------------------
-def _build_suggestion_prompt(proposal: Dict[str, Any], tone: str = "Formal", max_deliverables: int = 5, max_phases: int = 5) -> str:
+def _build_suggestion_prompt(proposal: Dict[str, Any], tone: str = "Formal", max_deliverables: int = 8, max_phases: int = 8) -> str:
     """
     Build a focused prompt asking the LLM to propose deliverables and phases.
-    Returns bilingual prompt (RU/EN short instructions) to improve locality.
+    Returns bilingual prompt (EN short instructions) to improve locality.
     The model MUST return exactly ONE JSON object and NOTHING ELSE.
     """
     client = proposal.get("client_name", "")
@@ -416,9 +416,6 @@ def _build_suggestion_prompt(proposal: Dict[str, Any], tone: str = "Formal", max
     prompt = f"""
 You are an experienced delivery/project manager and proposal writer.
 
-Task (RU):
-На основе краткого брифа предложи список ключевых Deliverables (рекомендуется до {max_deliverables}) и Phases (рекомендуется до {max_phases}) для коммерческого предложения.
-Возвращай РОВНО ОДИН JSON-ОБЪЕКТ и НИЧЕГО КРОМЕ ЕГО — без markdown, без пояснений.
 
 Task (EN):
 Based on the brief below, propose up to {max_deliverables} deliverables and up to {max_phases} phases (timeline steps).

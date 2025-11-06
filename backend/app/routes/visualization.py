@@ -1,41 +1,42 @@
-# backend/app/routes/visualization.py
-from fastapi import APIRouter, Response, HTTPException
-from pydantic import BaseModel
-from typing import Any, Dict
-import logging
+from fastapi import APIRouter, HTTPException
+from typing import Dict, Any
+from backend.app.services.visualization_service import (
+    generate_component_diagram,
+    generate_dataflow_diagram,
+    generate_deployment_diagram,
+    generate_gantt_image,
+)
 
-from backend.app.services.visualization_service import generate_uml_image, generate_gantt_image
+router = APIRouter(prefix="/api/v1/visualization", tags=["Visualization"])
 
-logger = logging.getLogger("uvicorn.error")
-router = APIRouter(prefix="/visualize", tags=["visualize"])
-
-
-class ProposalModel(BaseModel):
-    """
-    Универсальная модель запроса: содержит словарь payload.
-    Используем явное поле 'payload' вместо __root__ для совместимости
-    с Pydantic v1 и v2.
-    """
-    payload: Dict[str, Any]
-
-
-@router.post("/uml", response_class=Response)
-def visualize_uml(proposal: ProposalModel):
+@router.post("/component-diagram")
+async def component_diagram(data: Dict[str, Any]):
     try:
-        proposal_data = proposal.payload
-        img = generate_uml_image(proposal_data)
-        return Response(content=img, media_type="image/png")
+        image_bytes = generate_component_diagram(data)
+        return {"status": "ok", "size": len(image_bytes)}
     except Exception as e:
-        logger.exception("visualize_uml failed: %s", e)
-        raise HTTPException(status_code=500, detail="UML generation error")
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-@router.post("/gantt", response_class=Response)
-def visualize_gantt(proposal: ProposalModel):
+@router.post("/dataflow-diagram")
+async def dataflow_diagram(data: Dict[str, Any]):
     try:
-        proposal_data = proposal.payload
-        img = generate_gantt_image(proposal_data)
-        return Response(content=img, media_type="image/png")
+        image_bytes = generate_dataflow_diagram(data)
+        return {"status": "ok", "size": len(image_bytes)}
     except Exception as e:
-        logger.exception("visualize_gantt failed: %s", e)
-        raise HTTPException(status_code=500, detail="Gantt generation error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/deployment-diagram")
+async def deployment_diagram(data: Dict[str, Any]):
+    try:
+        image_bytes = generate_deployment_diagram(data)
+        return {"status": "ok", "size": len(image_bytes)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/gantt")
+async def gantt(data: Dict[str, Any]):
+    try:
+        image_bytes = generate_gantt_image(data)
+        return {"status": "ok", "size": len(image_bytes)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

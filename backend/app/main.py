@@ -16,6 +16,8 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from fastapi.responses import Response
 
 
+
+
 logger = logging.getLogger("uvicorn.error")
 
 doc_engine = None
