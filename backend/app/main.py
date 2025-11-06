@@ -26,7 +26,8 @@ except Exception as e:
     logger.warning("doc_engine not importable; DOCX generation disabled in this environment. Error: %s", e)
 
 try:
-    from backend.app.routes.visualization import router as visualization_route
+    
+    from backend.app.routes.visualization import router as visualization_router
 except Exception as e:
     # Если импорт не удался, doc_engine останется None
     logger.warning("visualization not importable; Error: %s", e)
@@ -93,7 +94,7 @@ except Exception:
     import logging
     logging.getLogger(__name__).warning("Observability init failed", exc_info=True)
 
-app.include_router(visualization_router)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -102,6 +103,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(visualization_router)
 
 @app.on_event("startup")
 def _on_startup():

@@ -6,8 +6,7 @@ from typing import Dict, Any, List, Optional
 from docx import Document
 from docx.shared import Pt, Inches
 from docx.table import Table
-import locale
-
+from backend.app.services.visualization_service import generate_uml_image, generate_gantt_image
 logger = logging.getLogger(__name__)
 
 PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
@@ -89,6 +88,38 @@ def _replace_in_header_footer(container, mapping: Dict[str, str]) -> None:
                 _replace_in_table(table, mapping)
             except Exception:
                 logger.exception("Header/footer table replacement failed; continuing.")
+
+def _find_and_replace_placeholder_with_image(doc: Document, placeholder: str, image_bytes: bytes, width_inches: float = 6.0) -> bool:
+    """
+    Находит параграф, содержащий placeholder (например "{{uml_diagram}}"),
+    очищает его и вставляет изображение. Если найдено - возвращает True, иначе False.
+    """
+    # поиск в параграфах
+    for p in doc.paragraphs:
+        if placeholder in p.text:
+            # очистить runs
+            for run in list(p.runs):
+                run.text = ""
+            # вставить картинку
+            run = p.add_run()
+            run.add_picture(BytesIO(image_bytes), width=Inches(width_inches))
+            p.alignment = 1  # центровать
+            return True
+
+    # поиск в таблицах (ячейки)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    if placeholder in p.text:
+                        for run in list(p.runs):
+                            run.text = ""
+                        run = p.add_run()
+                        run.add_picture(BytesIO(image_bytes), width=Inches(width_inches))
+                        p.alignment = 1
+                        return True
+    return False
+
 
 def _find_table_by_headers(doc: Document, headers: List[str]) -> Optional[Table]:
     """Находит первую таблицу, чья первая строка содержит все заданные заголовки."""
@@ -208,6 +239,61 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
     timeline_table = _find_table_by_headers(doc, ["Phase", "Duration", "Key Tasks"])
     if timeline_table and context.get("phases_list"):
         _append_timeline(timeline_table, context["phases_list"])
+    # 5.5 Generate and insert diagrams (UML & Gantt)
+    try:
+        # components: either come from context or synthesize from deliverables_list
+        components = context.get("components")
+        if components is None:
+            components = []
+            for i, d in enumerate(context.get("deliverables_list", []) or []):
+                components.append({
+                    "id": f"deliv_{i+1}",
+                    "title": d.get("title",""),
+                    "description": d.get("description",""),
+                    "depends_on": []
+                })
+
+        milestones = context.get("milestones")
+        if milestones is None:
+            milestones = []
+            for i, p in enumerate(context.get("phases_list", []) or []):
+                milestones.append({
+                    "name": p.get("phase_name") or p.get("tasks", f"Phase {i+1}")[:30],
+                    "start": None,
+                    "end": None,
+                    "duration_days": int(p.get("duration", p.get("duration_weeks", 4))) * 7 if (p.get("duration") or p.get("duration_weeks")) else None
+                })
+
+        # Generate images (these functions should return PNG bytes)
+        uml_bytes = None
+        gantt_bytes = None
+        try:
+            uml_bytes = generate_uml_image({"components": components})
+        except Exception as e:
+            logger.exception("UML generation failed: %s", e)
+
+        try:
+            gantt_bytes = generate_gantt_image({"milestones": milestones})
+        except Exception as e:
+            logger.exception("Gantt generation failed: %s", e)
+
+        # Insert images into placeholders
+        if uml_bytes:
+            inserted = _find_and_replace_placeholder_with_image(doc, "{{uml_diagram}}", uml_bytes, width_inches=6.0)
+            if not inserted:
+                # append at end if placeholder not found
+                p = doc.add_paragraph()
+                r = p.add_run()
+                r.add_picture(BytesIO(uml_bytes), width=Inches(6.0))
+        if gantt_bytes:
+            inserted = _find_and_replace_placeholder_with_image(doc, "{{gantt_chart}}", gantt_bytes, width_inches=6.0)
+            if not inserted:
+                p = doc.add_paragraph()
+                r = p.add_run()
+                r.add_picture(BytesIO(gantt_bytes), width=Inches(6.0))
+
+    except Exception:
+        logger.exception("Diagram generation/insert failed; continuing without diagrams.")
 
     # 6. Сохранение в BytesIO
     out = BytesIO()
