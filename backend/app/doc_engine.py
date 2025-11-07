@@ -1,5 +1,8 @@
+import os
 import re
 import json
+import shutil
+import tempfile
 import logging
 import locale
 import datetime
@@ -10,12 +13,12 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, Inches
 from docx.table import Table
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+from PIL import Image, ImageDraw, ImageFont
+
 
 # --- Импорт безопасных генераторов диаграмм ---
 from backend.app.services.visualization_service import (
-    generate_component_diagram,
-    generate_dataflow_diagram,
-    generate_deployment_diagram,
+    generate_uml_diagram,
     generate_gantt_image,
 )
 
@@ -220,57 +223,251 @@ def _normalize_visualization(context: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # --- Основная функция генерации ---
+# вставь этот блок внутри backend/app/doc_engine.py, заменив текущую render_docx_from_template
+def _placeholder_png_bytes(text: str = "UML unavailable", width: int = 800, height: int = 400) -> bytes:
+    # Простая заглушка — белое изображение с текстом
+    img = Image.new("RGB", (width, height), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    try:
+        # Попробуем системный шрифт
+        font = ImageFont.truetype("arial.ttf", 20)
+    except Exception:
+        font = ImageFont.load_default()
+    # center text
+    w, h = draw.textsize(text, font=font)
+    draw.text(((width-w)/2, (height-h)/2), text, fill=(50, 50, 50), font=font)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
 def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> BytesIO:
-    """Генерирует .docx предложение, включая все диаграммы"""
+    """
+    Improved rendering with heavy diagnostics for visualization generation.
+    - Logs full 'visualization' payload
+    - Saves viz JSON and intermediate PNGs to temp dir for inspection
+    - Synthesizes components/milestones from deliverables/phases as fallback
+    """
     doc = Document(template_path)
 
-    # 1. Подготовка замен
-    mapping = {k: (_format_currency(v) if "cost" in k else str(v or "")) for k, v in context.items()}
+    # 1. Prepare mapping (currency formatting preserved)
+    mapping = {}
+    for k, v in context.items():
+        if k in ("development_cost", "licenses_cost", "support_cost", "total_investment_cost"):
+            try:
+                mapping[k] = _format_currency(v)
+            except Exception:
+                mapping[k] = str(v or "")
+        else:
+            mapping[k] = "" if v is None else str(v)
 
-    # 2. Подстановка текста
-    for p in doc.paragraphs:
-        _replace_in_paragraph(p, mapping)
-    for t in doc.tables:
-        _replace_in_table(t, mapping)
+    # ensure aliases exist for template compatibility
+    if "client_company_name" in mapping and "client_name" not in mapping:
+        mapping["client_name"] = mapping["client_company_name"]
+    if "provider_company_name" in mapping and "provider_name" not in mapping:
+        mapping["provider_name"] = mapping["provider_company_name"]
 
-    # 3. Headers/Footers
-    for s in doc.sections:
-        _replace_in_header_footer(s.first_page_header, mapping)
-        _replace_in_header_footer(s.first_page_footer, mapping)
-        _replace_in_header_footer(s.header, mapping)
-        _replace_in_header_footer(s.footer, mapping)
+    # 2. Replace placeholders in paragraphs and tables
+    for para in doc.paragraphs:
+        try:
+            _replace_in_paragraph(para, mapping)
+        except Exception:
+            logger.exception("Paragraph replace failed.")
 
-    # 4. Таблицы Deliverables / Timeline
-    del_table = _find_table_by_headers(doc, ["Deliverable", "Description", "Acceptance"])
-    if del_table and context.get("deliverables_list"):
-        _append_deliverables(del_table, context["deliverables_list"])
+    for table in doc.tables:
+        try:
+            _replace_in_table(table, mapping)
+        except Exception:
+            logger.exception("Table replace failed.")
 
-    ph_table = _find_table_by_headers(doc, ["Phase", "Duration", "Key Tasks"])
-    if ph_table and context.get("phases_list"):
-        _append_timeline(ph_table, context["phases_list"])
+    # 3. Headers/footers
+    for section in doc.sections:
+        try:
+            _replace_in_header_footer(section.first_page_header, mapping)
+            _replace_in_header_footer(section.first_page_footer, mapping)
+            _replace_in_header_footer(section.header, mapping)
+            _replace_in_header_footer(section.footer, mapping)
+        except Exception:
+            logger.exception("Header/footer replacement failed.")
 
-    # 5. Генерация диаграмм
+    # 4. Append deliverables & timeline if present (keeps old behavior)
     try:
-        viz = _normalize_visualization(context)
+        deliverables_table = _find_table_by_headers(doc, ["Deliverable", "Description", "Acceptance"])
+        if deliverables_table and context.get("deliverables_list"):
+            _append_deliverables(deliverables_table, context["deliverables_list"])
+    except Exception:
+        logger.exception("Appending deliverables failed.")
 
-        comp_png = generate_component_diagram(viz)
-        dfd_png = generate_dataflow_diagram(viz)
-        dep_png = generate_deployment_diagram(viz)
+    try:
+        timeline_table = _find_table_by_headers(doc, ["Phase", "Duration", "Key Tasks"])
+        if timeline_table and context.get("phases_list"):
+            _append_timeline(timeline_table, context["phases_list"])
+    except Exception:
+        logger.exception("Appending timeline failed.")
+
+    # 5. Prepare visualization payload robustly and log it
+    def _normalize_visualization_local(ctx: Dict[str, Any]) -> Dict[str, Any]:
+        # Accept dict or JSON-string in ctx["visualization"]
+        raw = ctx.get("visualization")
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    raw = parsed
+            except Exception:
+                raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+
+        # fallback keys and permissive mapping for LLM variations
+        def pick(d, *keys):
+            for k in keys:
+                if k in d and d[k]:
+                    return d[k]
+            return []
+
+        vis = {}
+        vis["components"] = pick(raw, "components", "nodes", "elements", "services") or ctx.get("components") or ctx.get("deliverables_list") or []
+        vis["data_flows"] = pick(raw, "data_flows", "flows", "edges") or ctx.get("data_flows") or []
+        vis["infrastructure"] = pick(raw, "infrastructure", "infra", "servers", "hosts") or ctx.get("infrastructure") or []
+        vis["connections"] = pick(raw, "connections", "links", "network") or ctx.get("connections") or []
+        vis["milestones"] = pick(raw, "milestones", "timeline", "phases") or ctx.get("phases_list") or ctx.get("milestones") or []
+        return vis
+
+    viz = _normalize_visualization_local(context)
+
+    # Create diagnostics temp directory (unique per render)
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="proposal_viz_")
+        # Dump visualization payload for debugging
+        try:
+            with open(os.path.join(tmpdir, "viz_debug.json"), "w", encoding="utf-8") as fh:
+                json.dump(viz, fh, ensure_ascii=False, indent=2, default=str)
+            logger.info("Visualization payload dumped to %s", os.path.join(tmpdir, "viz_debug.json"))
+        except Exception:
+            logger.exception("Failed to write viz_debug.json")
+    except Exception:
+        tmpdir = None
+        logger.exception("Failed to create temp dir for viz debugging")
+
+    logger.debug("[DOC_ENGINE] Normalized visualization payload: %s", json.dumps(viz, ensure_ascii=False))
+
+    # If visualization is empty, attempt to synthesize minimal components/milestones
+    try:
+        if not viz.get("components"):
+            synth = []
+            # prefer deliverables_list (already normalized by template code)
+            for i, d in enumerate(context.get("deliverables_list", []) or []):
+                synth.append({
+                    "id": d.get("title")[:40] if isinstance(d.get("title"), str) else f"deliv_{i}",
+                    "title": d.get("title") or f"Deliverable {i+1}",
+                    "description": (d.get("description") or "")[:200],
+                    "type": "service",
+                    "depends_on": []
+                })
+            # if still empty, use top-level keys as nodes
+            if not synth:
+                for i, k in enumerate(list(context.keys())[:6]):
+                    synth.append({"id": k, "title": k, "description": str(context.get(k) or "")[:140], "type": "service", "depends_on": []})
+            viz["components"] = synth
+            logger.info("Synthesized %d components for visualization fallback.", len(synth))
+
+        if not viz.get("milestones"):
+            synth_ms = []
+            for i, p in enumerate(context.get("phases_list", []) or []):
+                start = None
+                end = None
+                try:
+                    dur_w = int(p.get("duration_weeks", 2))
+                except Exception:
+                    dur_w = 2
+                # generate start date sequence from proposal_date or today
+                try:
+                    base = context.get("proposal_date")
+                    if isinstance(base, str):
+                        base_dt = None
+                        try:
+                            base_dt = datetime.date.fromisoformat(base)
+                        except Exception:
+                            base_dt = None
+                        if base_dt:
+                            base = base_dt
+                    if not base:
+                        base = datetime.date.today()
+                except Exception:
+                    base = datetime.date.today()
+                s = base + datetime.timedelta(days=i * dur_w * 7)
+                e = s + datetime.timedelta(days=dur_w * 7)
+                synth_ms.append({"name": p.get("phase_name") or f"Phase {i+1}", "start": s.isoformat(), "end": e.isoformat(), "duration_days": dur_w * 7})
+            if synth_ms:
+                viz["milestones"] = synth_ms
+                logger.info("Synthesized %d milestones for visualization fallback.", len(synth_ms))
+    except Exception:
+        logger.exception("Synthesis fallback failed.")
+
+    # 6. Check Graphviz presence
+    try:
+        if not shutil.which("dot"):
+            logger.error("Graphviz 'dot' binary not found in PATH — diagrams may fail. Install Graphviz and add 'dot' to PATH.")
+    except Exception:
+        logger.exception("Could not check Graphviz binary presence.")
+
+    # 7. Generate diagrams and save intermediate PNGs for debugging
+    uml_png = gantt_png = None
+    
+    
+    try:
+        uml_png = generate_uml_diagram(viz)
+        if tmpdir and uml_png:
+            try:
+                with open(os.path.join(tmpdir, "uml.png"), "wb") as fh:
+                    fh.write(uml_png)
+            except Exception:
+                logger.exception("Failed saving uml.png")
+        if uml_png and len(uml_png) < 1500:
+            logger.warning("Gantt image likely placeholder (empty input or export error). Size=%d bytes", len(uml_png))
+    except Exception:
+        logger.exception("Gantt generation raised exception.")
+    try:
         gantt_png = generate_gantt_image(viz)
+        if tmpdir and gantt_png:
+            try:
+                with open(os.path.join(tmpdir, "gantt.png"), "wb") as fh:
+                    fh.write(gantt_png)
+            except Exception:
+                logger.exception("Failed saving gantt.png")
+        if gantt_png and len(gantt_png) < 1500:
+            logger.warning("Gantt image likely placeholder (empty input or export error). Size=%d bytes", len(gantt_png))
+    except Exception:
+        logger.exception("Gantt generation raised exception.")
 
-        if comp_png:
-            _insert_image_with_caption(doc, comp_png, "{{components_diagram}}", f"Figure. System components for {mapping.get('client_company_name','')}")
-        if dfd_png:
-            _insert_image_with_caption(doc, dfd_png, "{{dataflow_diagram}}", "Figure. Data Flow Diagram.")
-        if dep_png:
-            _insert_image_with_caption(doc, dep_png, "{{deployment_diagram}}", "Figure. Deployment Diagram.")
+    # 8. Insert images into doc (if present). If missing, insert explicit note
+   
+    try:
+        if uml_png:
+            _insert_image_with_caption(doc, uml_png, "{{uml_diagram}}", caption_text="Figure. UML Diagram.")
+        else:
+            _find_and_replace_placeholder_with_image(doc, "{{uml_diagram}}", _placeholder_png_bytes("Dataflow diagram unavailable"), width_inches=6.5)
+    except Exception:
+        logger.exception("Inserting UML Diagram failed.")
+
+    try:
         if gantt_png:
-            _insert_image_with_caption(doc, gantt_png, "{{gantt_chart}}", "Figure. Project Timeline.")
-    except Exception as e:
-        logger.exception("Diagram generation failed: %s", e)
+            _insert_image_with_caption(doc, gantt_png, "{{gantt_chart}}", caption_text="Figure. Project Timeline.")
+        else:
+            _find_and_replace_placeholder_with_image(doc, "{{gantt_chart}}", _placeholder_png_bytes("Gantt chart unavailable"), width_inches=6.5)
+    except Exception:
+        logger.exception("Inserting gantt failed.")
 
-    # 6. Возврат .docx
-    output = BytesIO()
-    doc.save(output)
-    output.seek(0)
-    return output
+    # 9. Save docx to BytesIO and also log location of debug dir (if any)
+    out = BytesIO()
+    try:
+        doc.save(out)
+        out.seek(0)
+    except Exception:
+        logger.exception("Failed saving docx to BytesIO.")
+        raise
+
+    if tmpdir:
+        logger.info("Visualization debug files saved to: %s", tmpdir)
+    return out
+
