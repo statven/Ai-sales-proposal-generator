@@ -8,7 +8,7 @@ import os
 import json
 import requests
 import streamlit as st
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List, Dict, Any
 import locale
 
@@ -33,6 +33,7 @@ MIN_PHASE_TASKS = 3
 MAX_PHASE_TASKS = 3000
 MIN_PHASE_WEEKS = 1
 MAX_PHASE_WEEKS = 52
+MIN_DEADLINE_DAYS = 31
 
 # ---------------- Helpers ----------------
 def _format_currency(value) -> str:
@@ -64,60 +65,105 @@ def safe_date_to_iso(d):
     return d.isoformat()
 
 def validate_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    errors = []
-    if not payload.get("client_company_name") or len(payload["client_company_name"].strip()) < MIN_CLIENT_NAME:
-        errors.append({"loc":["client_company_name"], "msg": f"client_company_name must be at least {MIN_CLIENT_NAME} characters"})
-    if not payload.get("provider_company_name") or len(payload["provider_company_name"].strip()) < MIN_PROVIDER_NAME:
-        errors.append({"loc":["provider_company_name"], "msg": f"provider_company_name must be at least {MIN_PROVIDER_NAME} characters"})
-    # deadline not in past
+    """
+    Validate payload for required fields. Return list of error dicts (pydantic-like).
+    Defensive: accepts None or non-dict and returns a single error.
+    """
+    errors: List[Dict[str, Any]] = []
+
+    # Defensive guards
+    if payload is None:
+        return [{"loc": ["payload"], "msg": "payload is missing (None)"}]
+    if not isinstance(payload, dict):
+        return [{"loc": ["payload"], "msg": f"payload must be an object/dict, got {type(payload).__name__}"}]
+
+    # required names
+    client = payload.get("client_company_name")
+    if not client or len(str(client).strip()) < MIN_CLIENT_NAME:
+        errors.append({"loc": ["client_company_name"], "msg": f"client_company_name must be at least {MIN_CLIENT_NAME} characters"})
+
+    provider = payload.get("provider_company_name")
+    if not provider or len(str(provider).strip()) < MIN_PROVIDER_NAME:
+        errors.append({"loc": ["provider_company_name"], "msg": f"provider_company_name must be at least {MIN_PROVIDER_NAME} characters"})
+
+    # deadline not in past (if provided)
+        # deadline not in past (if provided) and not earlier than minimal horizon
     dl = payload.get("deadline")
     if dl:
         try:
+            # dl may be date or ISO string
             if isinstance(dl, str):
                 d = date.fromisoformat(dl)
+            elif isinstance(dl, (date, datetime)):
+                d = dl if isinstance(dl, date) else dl.date()
             else:
-                d = dl
-            if d < datetime.utcnow().date():
-                errors.append({"loc":["deadline"], "msg":"deadline must not be in the past"})
+                raise ValueError("invalid type for deadline")
+
+            today_utc = datetime.utcnow().date()
+            # 1) must not be in the past
+            if d < today_utc:
+                errors.append({"loc": ["deadline"], "msg": "deadline must not be in the past"})
+            else:
+                # 2) must be at least MIN_DEADLINE_DAYS from today
+                min_allowed = today_utc + timedelta(days=MIN_DEADLINE_DAYS)
+                if d < min_allowed:
+                    errors.append({
+                        "loc": ["deadline"],
+                        "msg": f"deadline must be at least {MIN_DEADLINE_DAYS} days from today"
+                    })
         except Exception:
-            errors.append({"loc":["deadline"], "msg":"deadline invalid ISO date"})
-    # financials
+            errors.append({"loc": ["deadline"], "msg": "deadline invalid ISO date"})
+
+    # financials validation
     fin = payload.get("financials") or {}
+    if fin is None:
+        fin = {}
     for k in ("development_cost", "licenses_cost", "support_cost"):
         v = fin.get(k)
-        if v is not None:
+        if v is not None and v != "":
             try:
                 fv = float(v)
                 if fv < 0:
-                    errors.append({"loc":[k], "msg":"must be >= 0"})
+                    errors.append({"loc": [k], "msg": "must be >= 0"})
             except Exception:
-                errors.append({"loc":[k], "msg":"must be numeric"})
-    # deliverables
+                errors.append({"loc": [k], "msg": "must be numeric"})
+
+    # deliverables (backend expects list of dicts with acceptance_criteria)
     for i, d in enumerate(payload.get("deliverables", []) or []):
         if not isinstance(d, dict):
-            errors.append({"loc":["deliverables", i], "msg":"must be object"})
+            errors.append({"loc": ["deliverables", i], "msg": "must be object"})
             continue
         if len((d.get("title") or "").strip()) < MIN_DELV_TITLE:
-            errors.append({"loc":["deliverables", i, "title"], "msg": f"title must be at least {MIN_DELV_TITLE} chars"})
+            errors.append({"loc": ["deliverables", i, "title"], "msg": f"title must be at least {MIN_DELV_TITLE} chars"})
         if len((d.get("description") or "").strip()) < MIN_DELV_DESC:
-            errors.append({"loc":["deliverables", i, "description"], "msg": f"description must be at least {MIN_DELV_DESC} chars"})
-        # NOTE: now backend expects `acceptance_criteria`
+            errors.append({"loc": ["deliverables", i, "description"], "msg": f"description must be at least {MIN_DELV_DESC} chars"})
         if len((d.get("acceptance_criteria") or "").strip()) < MIN_DELV_ACC:
-            errors.append({"loc":["deliverables", i, "acceptance_criteria"], "msg": f"acceptance_criteria must be at least {MIN_DELV_ACC} chars"})
-    # phases
+            errors.append({"loc": ["deliverables", i, "acceptance_criteria"], "msg": f"acceptance_criteria must be at least {MIN_DELV_ACC} chars"})
+
+    # phases: require phase_name, duration_weeks, tasks
     for i, p in enumerate(payload.get("phases", []) or []):
         if not isinstance(p, dict):
-             errors.append({"loc":["phases", i], "msg":"must be object"})
-             continue
+            errors.append({"loc": ["phases", i], "msg": "must be object"})
+            continue
+
+        # phase_name required (user-visible)
+        phase_name = p.get("phase_name") or p.get("name") or ""
+        if not isinstance(phase_name, str) or len(phase_name.strip()) < 3:
+            errors.append({"loc": ["phases", i, "phase_name"], "msg": "phase_name must be at least 3 characters"})
+
+        # duration_weeks validation
         try:
             w = int(p.get("duration_weeks"))
             if w < MIN_PHASE_WEEKS or w > MAX_PHASE_WEEKS:
-                errors.append({"loc":["phases", i, "duration_weeks"], "msg": f"duration_weeks must be between {MIN_PHASE_WEEKS} and {MAX_PHASE_WEEKS}"})
+                errors.append({"loc": ["phases", i, "duration_weeks"], "msg": f"duration_weeks must be between {MIN_PHASE_WEEKS} and {MAX_PHASE_WEEKS}"})
         except Exception:
-            errors.append({"loc":["phases", i, "duration_weeks"], "msg":"must be integer"})
+            errors.append({"loc": ["phases", i, "duration_weeks"], "msg": "must be integer"})
+
         if len((p.get("tasks") or "").strip()) < MIN_PHASE_TASKS:
-            errors.append({"loc":["phases", i, "tasks"], "msg": f"tasks must be at least {MIN_PHASE_TASKS} chars"})
+            errors.append({"loc": ["phases", i, "tasks"], "msg": f"tasks must be at least {MIN_PHASE_TASKS} chars"})
+
     return errors
+
 
 # add_selected_suggestions unchanged (kept minimal)
 def add_selected_suggestions(list_type: str):
@@ -130,8 +176,10 @@ def add_selected_suggestions(list_type: str):
         suggestions = st.session_state.get("suggestions_data", {}).get("suggested_phases", [])
         target_state = "phases_state"
         prefix = "sphase_pick_"
+
     if not suggestions:
         return
+
     for i, item in enumerate(suggestions):
         checkbox_key = f"{prefix}{i}"
         if st.session_state.get(checkbox_key):
@@ -140,7 +188,6 @@ def add_selected_suggestions(list_type: str):
                 st.session_state.setdefault(target_state, []).append({
                     "title": item.get("title",""),
                     "description": item.get("description",""),
-                    # IMPORTANT: backend expects acceptance_criteria field name
                     "acceptance_criteria": acceptance_text
                 })
             else:
@@ -149,11 +196,13 @@ def add_selected_suggestions(list_type: str):
                 except Exception:
                     duration_weeks = 4
                 st.session_state.setdefault(target_state, []).append({
+                    "phase_name": item.get("phase_name", f"Phase {i+1}"),
                     "duration_weeks": duration_weeks,
                     "tasks": item.get("tasks","")
                 })
             st.session_state[checkbox_key] = False
             selected_count += 1
+
     if selected_count > 0:
         st.rerun()
 
@@ -165,7 +214,7 @@ st.title("AI Sales Proposal Generator ")
 with st.sidebar:
     st.header("Backend / Settings")
     api_base = st.text_input("API base URL", API_BASE_DEFAULT)
-    timeout_sec = st.number_input("Request timeout (s)", min_value=5, max_value=300, value=60, step=5)
+    timeout_sec = st.number_input("Request timeout (s)", min_value=5, max_value=1300, value=1300, step=5)
     st.markdown("**Tips:** Set API base to your FastAPI host, e.g. http://localhost:8000")
 
 generate_url, regenerate_url, suggest_url = build_api_urls(api_base)
@@ -186,6 +235,7 @@ with col_left:
 with col_right:
     st.subheader("Dates & Financials (USD)")
     deadline = st.date_input("Expected completion date", value=date.today(), key="deadline")
+    st.caption(f"Deadline must be at least {MIN_DEADLINE_DAYS} weeks from today.")
     development_cost = st.number_input("Development cost", min_value=0.0, value=45000.0, step=100.0, format="%.2f", key="development_cost")
     licenses_cost = st.number_input("Licenses cost", min_value=0.0, value=5000.0, step=50.0, format="%.2f", key="licenses_cost")
     support_cost = st.number_input("Support & maintenance", min_value=0.0, value=2500.0, step=50.0, format="%.2f", key="support_cost")
@@ -201,7 +251,7 @@ def build_payload(include_manual_deliverables=True, include_manual_phases=True):
     This function intentionally uses the exact key names:
       - client_company_name, provider_company_name
       - deliverables: list of {title, description, acceptance_criteria}
-      - phases: list of {duration_weeks, tasks}
+      - phases: list of {phase_name, duration_weeks, tasks}
       - financials: nested object
     These keys match the backend/template expectations.
     """
@@ -227,10 +277,20 @@ def build_payload(include_manual_deliverables=True, include_manual_phases=True):
     else:
         payload["deliverables"] = []
     if include_manual_phases:
-        payload["phases"] = st.session_state.get("phases_state", [])
+        payload["phases"] = [
+            {
+                "phase_name": p.get("phase_name",""),
+                "duration_weeks": int(p.get("duration_weeks",4)),
+                "tasks": p.get("tasks","")
+            }
+            for p in st.session_state.get("phases_state", [])
+        ]
     else:
         payload["phases"] = []
+
+    # return the constructed payload (important!)
     return payload
+
 
 # --- Buttons & status ---
 st.markdown("---")
@@ -274,45 +334,50 @@ with edit_cols[1]:
     if "phases_state" not in st.session_state:
         st.session_state["phases_state"] = []
     def add_empty_phase():
-        st.session_state["phases_state"].append({"duration_weeks":4, "tasks":""})
+        st.session_state["phases_state"].append({"phase_name":"", "duration_weeks":4, "tasks":""})
     st.button("Add new phase", on_click=add_empty_phase, key="add_phase_btn")
     for idx, p in enumerate(st.session_state["phases_state"]):
-        summary_preview = (p.get("tasks") or "")[:30] or "(Click to edit)"
+        summary_preview = p.get("phase_name") or "(Click to edit)"
         with st.expander(f"Phase #{idx+1}: {summary_preview}", expanded=False):
+            name = st.text_input(f"Phase name #{idx+1}", value=p.get("phase_name",""), key=f"phase_name_{idx}", max_chars=200)
             weeks = st.number_input(f"Duration weeks #{idx+1}", value=p.get("duration_weeks",4), min_value=MIN_PHASE_WEEKS, max_value=MAX_PHASE_WEEKS, key=f"phase_weeks_{idx}")
             tasks = st.text_area(f"Tasks #{idx+1}", value=p.get("tasks",""), key=f"phase_tasks_{idx}", max_chars=MAX_PHASE_TASKS)
-            st.session_state["phases_state"][idx] = {"duration_weeks":int(weeks), "tasks":tasks}
+            st.session_state["phases_state"][idx] = {"phase_name":name, "duration_weeks":int(weeks), "tasks":tasks}
         if st.button(f"Remove Phase #{idx+1}", key=f"phase_remove_{idx}"):
             st.session_state["phases_state"].pop(idx)
             st.rerun()
+
 
 # --- Suggestion retrieval ---
 if btn_suggest:
     st.session_state.pop("suggestions_data", None)
     payload = build_payload(include_manual_deliverables=False, include_manual_phases=False)
-    val_errs = validate_payload(payload)
-    if val_errs:
-        generation_status.error("**Fix validation errors** before requesting suggestions.")
-        for e in val_errs:
-            st.write(f"- **{'/'.join(map(str, e['loc']))}**: {e['msg']}")
+    if payload is None:
+        generation_status.error("Payload construction failed (None). Please check inputs.")
     else:
-        generation_status.info(" Requesting suggestions — please wait (calling /api/v1/suggest)")
-        try:
-            with st.spinner("Calling backend for suggestions..."):
-                r = requests.post(suggest_url, json=payload, timeout=timeout_sec)
-            if r.status_code == 200:
-                data = r.json()
-                st.session_state["suggestions_data"] = data
-                generation_status.success("Suggestions received. Select items below to add them to your proposal.")
-                st.rerun()
-            else:
-                try:
-                    err = r.json()
-                    generation_status.error(f"Server error ({r.status_code}): {err}")
-                except Exception:
-                    generation_status.error(f"Server returned status {r.status_code}: {r.text}")
-        except requests.RequestException as re:
-            generation_status.error(f" **Request failed**: {re}. Check backend at {suggest_url}")
+        val_errs = validate_payload(payload)
+        if val_errs:
+            generation_status.error("**Fix validation errors** before requesting suggestions.")
+            for e in val_errs:
+                st.write(f"- **{'/'.join(map(str, e['loc']))}**: {e['msg']}")
+        else:
+            generation_status.info(" Requesting suggestions — please wait (calling /api/v1/suggest)")
+            try:
+                with st.spinner("Calling backend for suggestions..."):
+                    r = requests.post(suggest_url, json=payload, timeout=timeout_sec)
+                if r.status_code == 200:
+                    data = r.json()
+                    st.session_state["suggestions_data"] = data
+                    generation_status.success("Suggestions received. Select items below to add them to your proposal.")
+                    st.rerun()
+                else:
+                    try:
+                        err = r.json()
+                        generation_status.error(f"Server error ({r.status_code}): {err}")
+                    except Exception:
+                        generation_status.error(f"Server returned status {r.status_code}: {r.text}")
+            except requests.RequestException as re:
+                generation_status.error(f" **Request failed**: {re}. Check backend at {suggest_url}")
 
 if st.session_state.get("suggestions_data"):
     st.markdown("---")
@@ -353,50 +418,53 @@ if st.session_state.get("suggestions_data"):
 # --- Generate final DOCX ---
 if btn_generate:
     payload = build_payload(include_manual_deliverables=True, include_manual_phases=True)
-    val_errs = validate_payload(payload)
-    if val_errs:
-        generation_status.error(" **Fix validation errors** before generating:")
-        for e in val_errs:
-            st.write(f"- **{'/'.join(map(str, e['loc']))}**: {e['msg']}")
+    if payload is None:
+        generation_status.error("Payload construction failed (None). Please check inputs.")
     else:
-        generation_status.info(" **Generating DOCX** — please wait")
-        try:
-            with st.spinner("Calling backend to generate DOCX..."):
-                r = requests.post(generate_url, json=payload, timeout=timeout_sec, stream=True)
-            if r.status_code == 200:
-                ct = r.headers.get("Content-Type","")
-                cd = r.headers.get("Content-Disposition","")
-                filename = f"Proposal_{client_company_name or 'proposal'}.docx"
-                if cd and "filename=" in cd:
-                    try:
-                        import urllib.parse, re
-                        match = re.search(r"filename\*=UTF-8''([^;]+)", cd)
-                        if match:
-                            filename = urllib.parse.unquote(match.group(1))
-                        else:
-                            filename = cd.split("filename=")[1].strip().strip('"')
-                    except Exception:
-                        pass
-                if "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in ct:
-                    data = r.content
-                    ver = r.headers.get("X-Proposal-Version")
-                    with generation_status.container():
-                        st.success(" **Document Generated Successfully!**")
-                        st.download_button("⬇️ Download DOCX", data=data, file_name=filename, mime=ct, use_container_width=True)
-                        if ver:
-                            st.info(f"Saved proposal version id: **{ver}**")
-                elif "application/json" in ct:
-                    generation_status.json(r.json())
+        val_errs = validate_payload(payload)
+        if val_errs:
+            generation_status.error(" **Fix validation errors** before generating:")
+            for e in val_errs:
+                st.write(f"- **{'/'.join(map(str, e['loc']))}**: {e['msg']}")
+        else:
+            generation_status.info(" **Generating DOCX** — please wait")
+            try:
+                with st.spinner("Calling backend to generate DOCX..."):
+                    r = requests.post(generate_url, json=payload, timeout=timeout_sec, stream=True)
+                if r.status_code == 200:
+                    ct = r.headers.get("Content-Type","")
+                    cd = r.headers.get("Content-Disposition","")
+                    filename = f"Proposal_{client_company_name or 'proposal'}.docx"
+                    if cd and "filename=" in cd:
+                        try:
+                            import urllib.parse, re
+                            match = re.search(r"filename\*=UTF-8''([^;]+)", cd)
+                            if match:
+                                filename = urllib.parse.unquote(match.group(1))
+                            else:
+                                filename = cd.split("filename=")[1].strip().strip('"')
+                        except Exception:
+                            pass
+                    if "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in ct:
+                        data = r.content
+                        ver = r.headers.get("X-Proposal-Version")
+                        with generation_status.container():
+                            st.success(" **Document Generated Successfully!**")
+                            st.download_button("⬇️ Download DOCX", data=data, file_name=filename, mime=ct, use_container_width=True)
+                            if ver:
+                                st.info(f"Saved proposal version id: **{ver}**")
+                    elif "application/json" in ct:
+                        generation_status.json(r.json())
+                    else:
+                        generation_status.write("Received unexpected content type:", ct)
                 else:
-                    generation_status.write("Received unexpected content type:", ct)
-            else:
-                try:
-                    err = r.json()
-                    generation_status.error(f"❌ Server responded with error ({r.status_code}): {err.get('detail','')}")
-                except Exception:
-                    generation_status.error(f"❌ Server error {r.status_code}: {r.text}")
-        except requests.RequestException as re:
-            generation_status.error(f"❌ Request failed: {re}")
+                    try:
+                        err = r.json()
+                        generation_status.error(f"❌ Server responded with error ({r.status_code}): {err.get('detail','')}")
+                    except Exception:
+                        generation_status.error(f"❌ Server error {r.status_code}: {r.text}")
+            except requests.RequestException as re:
+                generation_status.error(f"❌ Request failed: {re}")
 
 # Regenerate by version id
 st.markdown("---")
@@ -445,6 +513,6 @@ st.markdown("## Notes")
 st.markdown("""
 - **Backend requirement:** Ensure your FastAPI backend is running at the configured URL (`http://localhost:8000` by default).
 - **Key mapping:** This UI sends `client_company_name` and `provider_company_name` to match the DOCX template placeholders.
-- **Deliverables / Phases:** Deliverables are sent as `{"title","description","acceptance_criteria"}` and phases as `{"duration_weeks","tasks"}`.
+- **Deliverables / Phases:** Deliverables are sent as `{"title","description","acceptance_criteria"}` and phases as `{"phase_name","duration_weeks","tasks"}`.
 - **Suggestions:** Use "Get LLM suggestions" to receive suggested deliverables/phases; add selected suggestions into manual lists before generating.
 """)

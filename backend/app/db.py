@@ -31,7 +31,12 @@ class ProposalVersion(Base):
 
 def init_db():
     Base.metadata.create_all(bind=ENGINE)
-
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 def save_version(payload: Dict[str, Any], ai_sections: Optional[Dict[str, Any]] = None, used_model: Optional[str] = None, note: Optional[str] = None) -> int:
     s = SessionLocal()
     try:

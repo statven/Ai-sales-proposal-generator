@@ -24,17 +24,14 @@ doc_engine = None
 try:
     import backend.app.doc_engine as doc_engine
 except Exception as e:
-    # Если импорт не удался, doc_engine останется None
     logger.warning("doc_engine not importable; DOCX generation disabled in this environment. Error: %s", e)
 
 try:
-    from backend.app.routes.visualization import router as visualization_route
+    from backend.app.routes.visualization import router as visualization_router
 except Exception as e:
-    # Если импорт не удался, doc_engine останется None
     logger.warning("visualization not importable; Error: %s", e)
 
-# FIX: Делаем импорт 'observability' опциональным, как и другие сервисы.
-# Это предотвратит падение при отсутствии модуля observability.py.
+
 observability = None
 try:
     from backend.app import observability
@@ -78,7 +75,6 @@ except Exception:
 app = FastAPI(title="AI Sales Proposal Generator (Backend)")
 
 
-# Инициализация observability
 try:
     observability.setup_logging()
     # register simple prometheus endpoint
@@ -91,7 +87,6 @@ try:
     # attach middleware manually (works for FastAPI/Starlette)
     app.middleware("http")(observability.metrics_middleware(app))
 except Exception:
-    # не ломаем приложение если observability не установлена/ошибка
     import logging
     logging.getLogger(__name__).warning("Observability init failed", exc_info=True)
 
@@ -99,25 +94,22 @@ except Exception:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # на проде конкретные домены
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(visualization_route)
 
+app.include_router(visualization_router)
 @app.on_event("startup")
 def _on_startup():
-    # Инициируем БД при старте (если есть)
     try:
         if "db" in globals() and db is not None and hasattr(db, "init_db"):
             db.init_db()
     except Exception as e:
-        # тест ожидает, что будет залогировано сообщение об ошибке и текст "Error initializing database"
         logger.error("Error initializing database: %s", e)
 
-    # Инициируем openai_service, если он имеет init()
     try:
         if "openai_service" in globals() and openai_service is not None and hasattr(openai_service, "init"):
             try:
@@ -129,15 +121,12 @@ def _on_startup():
     sentry = os.environ.get("SENTRY_DSN")
     if sentry:
             try:
-                # Не импортируем sentry_sdk по-умолчанию — импортируйте только если он установлен.
                 import sentry_sdk
                 from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
 
                 sentry_sdk.init(dsn=sentry)
-                # Если вы используете FastAPI app прямо в этом модуле, обернуть app в middleware можно в on_startup.
                 logger.info("SENTRY_DSN configured (not printed).")
             except Exception as exc:
-                # Не прерываем запуск приложения, но логируем причину
                 logger.warning("Failed to initialize Sentry SDK: %s", exc)
 
 
@@ -170,11 +159,6 @@ def _on_shutdown():
 TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", os.path.join(os.getcwd(), "docs", "template.docx"))
 if not os.path.exists(TEMPLATE_PATH):
     logger.warning("Template not found at %s. Ensure template.docx is present.", TEMPLATE_PATH)
-
-
-
-# ----------------- Helpers -----------------
-from typing import Any  # если ещё не импортировано
 
 def _proposal_to_dict(proposal_obj: Any) -> Dict[str, Any]:
     """
@@ -467,9 +451,7 @@ def _sanitize_ai_text(s: Optional[str], context: Dict[str, Any]) -> str:
         text = text.rstrip() + "\n" + provider_val
 
     # 7) Final whitespace normalization:
-    # Replace any run of whitespace (spaces/tabs/newlines) with:
-    #   - a single '\n' if the run contains at least one newline
-    #   - otherwise a single space ' '
+
     def _ws_repl(m):
         grp = m.group(0)
         if "\n" in grp:
@@ -499,7 +481,7 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
         logger.exception("Failed to normalize incoming payload: %s", e)
         raise HTTPException(status_code=400, detail=f"Payload normalization failed: {e}")
 
-    # 2. Валидация Pydantic
+    # 2. Pydantic
     try:
         proposal = ProposalInput(**normalized)
     except ValidationError as ve:
@@ -590,13 +572,36 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
                     ai_sections[k] = ""
     else:
         ai_sections = {}
-
-    # 6. Merge AI sections into context carefully
-    # textual keys (ensure they exist)
     textual_keys = [
-        "executive_summary_text","project_mission_text","solution_concept_text",
-        "project_methodology_text","financial_justification_text","payment_terms_text",
-        "development_note","licenses_note","support_note"
+        "executive_summary_text",
+        "project_mission_text",
+        
+        # Раздел 6
+        "assumptions_text",
+        "risks_text",
+        
+        # Раздел 7
+        "technical_backend_text",
+        "technical_frontend_text",
+        "technical_deployment_text",
+        "engagement_model_text",
+        
+        # Раздел 8
+        "delivery_approach_text",
+        "team_structure_text",
+        "status_reporting_text",
+        "phases_summary_text",
+
+        # Раздел 9
+        "qa_strategy_text",
+        "qa_testing_types_text",
+        
+        # Раздел 10 (Финансы)
+        "financial_justification_text",
+        "payment_terms_text",
+        "development_note",
+        "licenses_note",
+        "support_note"
     ]
     for k in textual_keys:
         if k in ai_sections:
@@ -1020,6 +1025,9 @@ def suggest(payload: Dict[str, Any] = Body(...)):
     except Exception as e:
         logger.exception("Suggestion generation failed: %s", e)
         return JSONResponse(status_code=500, content={"detail": "Suggestion generation failed."})
+
+
+
 
 @app.get("/api/v1/version/{version_id}")
 def get_version(version_id: int):

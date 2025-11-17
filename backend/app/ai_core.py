@@ -18,18 +18,32 @@ logger = logging.getLogger("uvicorn.error")
 EXPECTED_KEYS: List[str] = [
     "executive_summary_text",
     "project_mission_text",
-    "solution_concept_text",
-    "project_methodology_text",
-    "financial_justification_text",
+    
+    # НОВЫЕ КЛЮЧИ (V3)
+    "assumptions_text",
+    "risks_text",
+    "technical_backend_text",
+    "technical_frontend_text",
+    "technical_deployment_text",
+    "engagement_model_text",
+    "delivery_approach_text",
+    "team_structure_text",
+    "status_reporting_text",
+    "qa_strategy_text",
+    "qa_testing_types_text",
+
+
     "payment_terms_text",
     "development_note",
     "licenses_note",
     "support_note",
-    # new keys used for visualization
-    "components",
-    "milestones",
+    "phases_summary_text", 
+    "financial_justification_text",
+    "suggested_deliverables",
+    "suggested_phases",
+    "visualization", # Ключ для визуализации
 ]
-
+# ...
 
 
 # (FIX 1: Более надежный экстрактор JSON)
@@ -164,6 +178,8 @@ async def generate_ai_sections_safe(proposal: Dict[str, Any]) -> Dict[str, str]:
         "development_note": "Estimate includes development, QA, and DevOps.",
         "licenses_note": "Includes required SaaS licenses and hosting.",
         "support_note": "Includes 3 months of post-launch support.",
+        "phases_summary_text": "The project will be executed in several distinct phases, starting with discovery and design, followed by development sprints, and concluding with QA and deployment. Key deliverables will be provided at the end of each major stage, ensuring a transparent and iterative delivery process.",
+        "financial_justification_text": "Expected efficiency gains and revenue uplift justify the investment.",
     }
     return safe
 
@@ -329,8 +345,38 @@ async def process_ai_content(proposal: Dict[str, Any], tone: str = "Formal") -> 
 
     # Normalize: ensure keys exist and types correct
     out = {}
-    textual_keys = ["executive_summary_text","project_mission_text","solution_concept_text","project_methodology_text",
-                    "financial_justification_text","payment_terms_text","development_note","licenses_note","support_note"]
+    textual_keys = [
+        "executive_summary_text",
+        "project_mission_text",
+        
+        # Раздел 6
+        "assumptions_text",
+        "risks_text",
+        
+        # Раздел 7
+        "technical_backend_text",
+        "technical_frontend_text",
+        "technical_deployment_text",
+        "engagement_model_text",
+        
+        # Раздел 8
+        "delivery_approach_text",
+        "team_structure_text",
+        "status_reporting_text",
+
+        # Раздел 9
+        "qa_strategy_text",
+        "qa_testing_types_text",
+        "phases_summary_text", 
+        "financial_justification_text",
+        
+        # Раздел 10 (Финансы)
+        "financial_justification_text",
+        "payment_terms_text",
+        "development_note",
+        "licenses_note",
+        "support_note"
+    ]
     for k in textual_keys:
         out[k] = parsed.get(k) if parsed.get(k) is not None else ""
     # suggestions

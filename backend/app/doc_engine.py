@@ -1,25 +1,25 @@
+# backend/app/doc_engine.py
 import os
 import re
 import json
-import shutil
 import tempfile
 import logging
 import locale
-import datetime
 from io import BytesIO
 from typing import Dict, Any, List, Optional
 from docx import Document
-from docx.oxml.ns import qn
-from docx.shared import Pt, Inches
+from docx.shared import Inches
 from docx.table import Table
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from PIL import Image, ImageDraw, ImageFont
 
-
+DEFAULT_TARGET_DPI = 300
+MAX_PAGE_WIDTH_INCHES = 7.3
+MAX_PAGE_HEIGHT_INCHES = 8.3 
 # --- Импорт безопасных генераторов диаграмм ---
 from backend.app.services.visualization_service import (
-    generate_uml_diagram,
     generate_gantt_image,
+    generate_lifecycle_diagram,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,26 +49,78 @@ def _format_currency(value) -> str:
         except Exception:
             return str(value)
 
+# --- Очистка context от повторных подписей/имен компаний ---
+def sanitize_context(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Убирает вхождения client/provider имени в конце больших текстовых полей,
+    чтобы имена компаний появлялись только через соответствующие placeholders.
+    """
+    out = dict(ctx)  # shallow copy
+    client = str(out.get("client_company_name") or out.get("client_name") or "").strip()
+    provider = str(out.get("provider_company_name") or out.get("provider_name") or "").strip()
+
+    if not client and not provider:
+        return out
+
+    # regex: удаляет повторяющиеся вхождения имени клиента/провайдера в конце строки
+    def _strip_trailing_names(s: str) -> str:
+        if not isinstance(s, str) or not s.strip():
+            return s
+        res = s
+        # удаляем как клиент, так и провайдер если они в конце
+        for nm in (client, provider):
+            if not nm:
+                continue
+            res = re.sub(rf"(\r?\n|\s)*{re.escape(nm)}(\s*)$", "", res)
+        # трим пробельные окончания и лишние пустые строки на конце
+        res = re.sub(r"\n{3,}", "\n\n", res).rstrip()
+        return res
+
+    # ключи, которые не трогаем (это сами поля с именами/подписями)
+    keep = {
+        "client_company_name", "client_name", "client_signature_name",
+        "provider_company_name", "provider_name", "provider_signature_name",
+        "client_signature_date", "provider_signature_date"
+    }
+
+    for k, v in list(out.items()):
+        if k in keep:
+            continue
+        if isinstance(v, str):
+            out[k] = _strip_trailing_names(v)
+    return out
 
 # --- Вспомогательные функции замены текста ---
 def _replace_in_paragraph(paragraph, mapping: Dict[str, str]) -> None:
+    """
+    Надёжная замена: склеиваем runs, заменяем (ключи по убыванию длины),
+    очищаем run'ы и добавляем один run с результирующим текстом.
+    """
     full_text = "".join(run.text for run in paragraph.runs)
     if not full_text:
         return
 
     new_text = full_text
     replaced = False
+    matched_keys: List[str] = []
 
-    for k, v in mapping.items():
+    # сортируем ключи по длине — чтобы исключить проблемы типа 'title' и 'project_title'
+    for k in sorted(mapping.keys(), key=lambda x: -len(x)):
+        v = mapping.get(k, "")
         ph = f"{{{{{k}}}}}"
         if ph in new_text:
             new_text = new_text.replace(ph, v or "")
             replaced = True
+            matched_keys.append(k)
+
+    if matched_keys:
+        logger.info("[DOC_ENGINE] Paragraph %s matched keys: %s", hex(id(paragraph)), matched_keys)
 
     if replaced and new_text != full_text:
         for run in paragraph.runs:
             run.text = ""
         paragraph.add_run(new_text)
+        logger.debug("[DOC_ENGINE] AFTER_REPLACE paragraph id=%s new_text=%r", hex(id(paragraph)), new_text)
 
 
 def _replace_in_table(table: Table, mapping: Dict[str, str]) -> None:
@@ -86,10 +138,58 @@ def _replace_in_header_footer(container, mapping: Dict[str, str]) -> None:
     if hasattr(container, "tables"):
         for t in container.tables:
             _replace_in_table(t, mapping)
+def _compute_target_image_inches(png_bytes: bytes,
+                                 max_width_in: float = MAX_PAGE_WIDTH_INCHES,
+                                 max_height_in: float = MAX_PAGE_HEIGHT_INCHES,
+                                 fallback_dpi: int = DEFAULT_TARGET_DPI):
+    """
+    Возвращает (target_w_in, target_h_in, dpi, orig_w_in, orig_h_in).
+    Масштабирует пропорционально, чтобы вписаться в max_width_in x max_height_in.
+    Не масштабирует вверх (scale <= 1.0).
+    """
+    try:
+        img = Image.open(BytesIO(png_bytes))
+        info = img.info or {}
+        dpi = None
+        if "dpi" in info:
+            dval = info.get("dpi")
+            if isinstance(dval, (tuple, list)) and len(dval) >= 1:
+                try:
+                    dpi = int(dval[0])
+                except Exception:
+                    dpi = None
+            else:
+                try:
+                    dpi = int(dval)
+                except Exception:
+                    dpi = None
+        if not dpi:
+            dpi = int(fallback_dpi)
+
+        orig_w_in = img.width / dpi
+        orig_h_in = img.height / dpi
+
+        # если размеры некорректны — fallback
+        if orig_w_in <= 0 or orig_h_in <= 0:
+            return None, None, dpi, None, None
+
+        # вычисляем масштаб, чтобы вписать в оба ограничения
+        scale_w = max_width_in / orig_w_in if orig_w_in > 0 else 1.0
+        scale_h = max_height_in / orig_h_in if orig_h_in > 0 else 1.0
+
+        scale = min(scale_w, scale_h, 1.0)  # не увеличиваем (не upscale)
+
+        target_w_in = orig_w_in * scale
+        target_h_in = orig_h_in * scale
+
+        return round(target_w_in, 3), round(target_h_in, 3), int(dpi), round(orig_w_in, 3), round(orig_h_in, 3)
+    except Exception:
+        return None, None, fallback_dpi, None, None
 
 
 # --- Поиск и вставка изображений ---
-def _find_and_replace_placeholder_with_image(doc: Document, placeholder: str, image_bytes: bytes, width_inches: float = 6.0) -> bool:
+def _find_and_replace_placeholder_with_image(doc: Document, placeholder: str, image_bytes: bytes,
+                                             width_inches: float = 7.5, height_inches: Optional[float] = None) -> bool:
     """Находит {{placeholder}} и заменяет его изображением"""
     for p in doc.paragraphs:
         if placeholder in p.text:
@@ -97,7 +197,10 @@ def _find_and_replace_placeholder_with_image(doc: Document, placeholder: str, im
                 r.text = ""
             run = p.add_run()
             try:
-                run.add_picture(BytesIO(image_bytes), width=Inches(width_inches))
+                if height_inches:
+                    run.add_picture(BytesIO(image_bytes), width=Inches(width_inches), height=Inches(height_inches))
+                else:
+                    run.add_picture(BytesIO(image_bytes), width=Inches(width_inches))
             except Exception:
                 p.add_run("[Image could not be embedded]")
             p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
@@ -112,7 +215,10 @@ def _find_and_replace_placeholder_with_image(doc: Document, placeholder: str, im
                             r.text = ""
                         run = p.add_run()
                         try:
-                            run.add_picture(BytesIO(image_bytes), width=Inches(width_inches))
+                            if height_inches:
+                                run.add_picture(BytesIO(image_bytes), width=Inches(width_inches), height=Inches(height_inches))
+                            else:
+                                run.add_picture(BytesIO(image_bytes), width=Inches(width_inches))
                         except Exception:
                             p.add_run("[Image could not be embedded]")
                         p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
@@ -120,34 +226,23 @@ def _find_and_replace_placeholder_with_image(doc: Document, placeholder: str, im
     return False
 
 
-def _run_has_picture(run) -> bool:
-    try:
-        for _ in run._element.xpath('.//pic:pic', {'pic': 'http://schemas.openxmlformats.org/drawingml/2006/picture'}):
-            return True
-    except Exception:
-        if run._element.xpath('.//w:drawing'):
-            return True
-    return False
-
-
-def _insert_image_with_caption(doc: Document, image_bytes: bytes, placeholder: str, caption_text: str, width_inches: float = 6.5):
-    """Вставляет картинку и подпись под ней"""
-    inserted = _find_and_replace_placeholder_with_image(doc, placeholder, image_bytes, width_inches)
+def _insert_image_with_caption(doc: Document, image_bytes: bytes, placeholder: str,
+                               width_inches: float = 8.5, height_inches: Optional[float] = None):
+    inserted = _find_and_replace_placeholder_with_image(doc, placeholder, image_bytes, width_inches, height_inches)
     if not inserted:
         # если плейсхолдер не найден — добавляем в конец
         p = doc.add_paragraph()
         p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
         run = p.add_run()
         try:
-            run.add_picture(BytesIO(image_bytes), width=Inches(width_inches))
+            if height_inches:
+                run.add_picture(BytesIO(image_bytes), width=Inches(width_inches), height=Inches(height_inches))
+            else:
+                run.add_picture(BytesIO(image_bytes), width=Inches(width_inches))
         except Exception:
             p.add_run("[Image could not be embedded]")
-    # подпись
-    cap_para = doc.add_paragraph(caption_text)
-    cap_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-    run = cap_para.add_run(caption_text)
-    run.font.size = Pt(9)
-    run.italic = True
+    # подпи
+
 
 
 # --- Таблицы ---
@@ -197,59 +292,60 @@ def _append_timeline(table: Table, phases: List[Dict[str, str]], max_rows: int =
         except Exception:
             logger.exception("Failed to add timeline row")
 
-
-# --- Нормализация данных визуализации ---
-def _normalize_visualization(context: Dict[str, Any]) -> Dict[str, Any]:
-    """Создает корректный payload для визуализации"""
-    raw = context.get("visualization")
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                raw = parsed
-        except Exception:
-            raw = {}
-    if not isinstance(raw, dict):
-        raw = {}
-    # fallback из context
-    vis = {
-        "components": raw.get("components") or context.get("components") or [],
-        "data_flows": raw.get("data_flows") or context.get("data_flows") or [],
-        "infrastructure": raw.get("infrastructure") or context.get("infrastructure") or [],
-        "connections": raw.get("connections") or context.get("connections") or [],
-        "milestones": raw.get("milestones") or context.get("phases_list") or context.get("milestones") or []
-    }
-    return vis
-
-
-# --- Основная функция генерации ---
-# вставь этот блок внутри backend/app/doc_engine.py, заменив текущую render_docx_from_template
-def _placeholder_png_bytes(text: str = "UML unavailable", width: int = 800, height: int = 400) -> bytes:
-    # Простая заглушка — белое изображение с текстом
+def _placeholder_png_bytes(text: str = "Diagram unavailable", width: int = 800, height: int = 400) -> bytes:
     img = Image.new("RGB", (width, height), color=(255, 255, 255))
     draw = ImageDraw.Draw(img)
     try:
-        # Попробуем системный шрифт
         font = ImageFont.truetype("arial.ttf", 20)
-    except Exception:
+    except IOError:
         font = ImageFont.load_default()
-    # center text
-    w, h = draw.textsize(text, font=font)
-    draw.text(((width-w)/2, (height-h)/2), text, fill=(50, 50, 50), font=font)
-    buf = io.BytesIO()
+    
+    try:
+        # draw.textbbox((x, y), text, font) возвращает (left, top, right, bottom)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+    except Exception as e:
+        # Fallback values
+        logger.error("Error calculating text size using textbbox: %s", str(e))
+        text_width, text_height = 300, 25 
+    
+    # 2. Вычисляем позицию для центрирования
+    x = (width - text_width) / 2
+    y = (height - text_height) / 2
+    
+    # 3. Рисуем текст
+    draw.text((x, y), text, fill=(50, 50, 50), font=font)
+    
+    # 4. Сохраняем в буфер
+    buf = BytesIO()
     img.save(buf, format="PNG")
+    
     return buf.getvalue()
 
-def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> BytesIO:
-    """
-    Improved rendering with heavy diagnostics for visualization generation.
-    - Logs full 'visualization' payload
-    - Saves viz JSON and intermediate PNGs to temp dir for inspection
-    - Synthesizes components/milestones from deliverables/phases as fallback
-    """
-    doc = Document(template_path)
+def _insert_lifecycle_diagram(doc: Document, image_bytes: bytes, placeholder: str, 
+                              width_inches: float = 6.5, height_inches: Optional[float] = None):
+    inserted = _find_and_replace_placeholder_with_image(doc, placeholder, image_bytes, width_inches, height_inches)
+    if not inserted:
+        p = doc.add_paragraph()
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        run = p.add_run()
+        try:
+            if height_inches:
+                run.add_picture(BytesIO(image_bytes), width=Inches(width_inches), height=Inches(height_inches))
+            else:
+                run.add_picture(BytesIO(image_bytes), width=Inches(width_inches))
+        except Exception:
+            p.add_run("[Image could not be embedded]")
 
+
+def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> BytesIO:
+    doc = Document(template_path)
     # 1. Prepare mapping (currency formatting preserved)
+        # 1. Prepare mapping (currency formatting preserved)
+    # Сначала чистим context от лишних подписей
+    context = sanitize_context(context)
+
     mapping = {}
     for k, v in context.items():
         if k in ("development_cost", "licenses_cost", "support_cost", "total_investment_cost"):
@@ -260,26 +356,55 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
         else:
             mapping[k] = "" if v is None else str(v)
 
-    # ensure aliases exist for template compatibility
-    if "client_company_name" in mapping and "client_name" not in mapping:
-        mapping["client_name"] = mapping["client_company_name"]
-    if "provider_company_name" in mapping and "provider_name" not in mapping:
-        mapping["provider_name"] = mapping["provider_company_name"]
+    # diagnostic dump mapping (temporary)
+    try:
+        dbg = os.path.join(tempfile.gettempdir(), "doc_engine_mapping_dump.json")
+        with open(dbg, "w", encoding="utf-8") as fh:
+            json.dump(mapping, fh, ensure_ascii=False, indent=2)
+        logger.info("[DOC_ENGINE] Mapping dumped to %s", dbg)
+    except Exception:
+        logger.exception("Failed dumping mapping")
+
+
 
     # 2. Replace placeholders in paragraphs and tables
-    for para in doc.paragraphs:
-        try:
-            _replace_in_paragraph(para, mapping)
-        except Exception:
-            logger.exception("Paragraph replace failed.")
+    original_paragraphs = list(doc.paragraphs)
+    
+    for p in original_paragraphs:
+        
+        full_text = "".join(run.text for run in p.runs)
 
-    for table in doc.tables:
-        try:
-            _replace_in_table(table, mapping)
-        except Exception:
-            logger.exception("Table replace failed.")
+        if "{{" not in full_text:
+            continue # Нет плейсхолдеров, пропускаем
 
-    # 3. Headers/footers
+
+        new_full_text = full_text
+        has_replacement = False
+        for k, v in mapping.items():
+            ph = f"{{{{{k}}}}}"
+            if ph in new_full_text:
+                new_full_text = new_full_text.replace(ph, v) # 'v' уже строка
+                has_replacement = True
+        
+        if not has_replacement:
+            continue
+        for r in p.runs:
+            r.text = ""
+        lines = new_full_text.split('\n')
+        _apply_formatting_to_run(p, lines[0] if lines else "")
+            
+        anchor_element = p._p 
+        
+        for line in lines[1:]:
+            new_p = doc.add_paragraph()
+            _apply_formatting_to_run(new_p, line)
+            anchor_element.addnext(new_p._p)
+            anchor_element = new_p._p
+
+
+
+
+    # 3. Headers/footers (Эта часть остается без изменений)
     for section in doc.sections:
         try:
             _replace_in_header_footer(section.first_page_header, mapping)
@@ -288,8 +413,15 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
             _replace_in_header_footer(section.footer, mapping)
         except Exception:
             logger.exception("Header/footer replacement failed.")
-
-    # 4. Append deliverables & timeline if present (keeps old behavior)
+            
+    # 4. Tables
+    for table in doc.tables:
+        try:
+            _replace_in_table(table, mapping)
+        except Exception:
+            logger.exception("Table replace failed.")
+            
+    # 4.1 Append deliverables & timeline (Эта часть остается без изменений)
     try:
         deliverables_table = _find_table_by_headers(doc, ["Deliverable", "Description", "Acceptance"])
         if deliverables_table and context.get("deliverables_list"):
@@ -303,10 +435,8 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
             _append_timeline(timeline_table, context["phases_list"])
     except Exception:
         logger.exception("Appending timeline failed.")
-
     # 5. Prepare visualization payload robustly and log it
     def _normalize_visualization_local(ctx: Dict[str, Any]) -> Dict[str, Any]:
-        # Accept dict or JSON-string in ctx["visualization"]
         raw = ctx.get("visualization")
         if isinstance(raw, str):
             try:
@@ -338,7 +468,6 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
     # Create diagnostics temp directory (unique per render)
     try:
         tmpdir = tempfile.mkdtemp(prefix="proposal_viz_")
-        # Dump visualization payload for debugging
         try:
             with open(os.path.join(tmpdir, "viz_debug.json"), "w", encoding="utf-8") as fh:
                 json.dump(viz, fh, ensure_ascii=False, indent=2, default=str)
@@ -351,82 +480,61 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
 
     logger.debug("[DOC_ENGINE] Normalized visualization payload: %s", json.dumps(viz, ensure_ascii=False))
 
-    # If visualization is empty, attempt to synthesize minimal components/milestones
+    # 6. Generate lifecycle diagram image
+    
+    lifecycle_png = None
     try:
-        if not viz.get("components"):
-            synth = []
-            # prefer deliverables_list (already normalized by template code)
-            for i, d in enumerate(context.get("deliverables_list", []) or []):
-                synth.append({
-                    "id": d.get("title")[:40] if isinstance(d.get("title"), str) else f"deliv_{i}",
-                    "title": d.get("title") or f"Deliverable {i+1}",
-                    "description": (d.get("description") or "")[:200],
-                    "type": "service",
-                    "depends_on": []
-                })
-            # if still empty, use top-level keys as nodes
-            if not synth:
-                for i, k in enumerate(list(context.keys())[:6]):
-                    synth.append({"id": k, "title": k, "description": str(context.get(k) or "")[:140], "type": "service", "depends_on": []})
-            viz["components"] = synth
-            logger.info("Synthesized %d components for visualization fallback.", len(synth))
+        logger.debug("Visualization data for lifecycle diagram: %s", json.dumps(viz, ensure_ascii=False))
 
-        if not viz.get("milestones"):
-            synth_ms = []
-            for i, p in enumerate(context.get("phases_list", []) or []):
-                start = None
-                end = None
-                try:
-                    dur_w = int(p.get("duration_weeks", 2))
-                except Exception:
-                    dur_w = 2
-                # generate start date sequence from proposal_date or today
-                try:
-                    base = context.get("proposal_date")
-                    if isinstance(base, str):
-                        base_dt = None
-                        try:
-                            base_dt = datetime.date.fromisoformat(base)
-                        except Exception:
-                            base_dt = None
-                        if base_dt:
-                            base = base_dt
-                    if not base:
-                        base = datetime.date.today()
-                except Exception:
-                    base = datetime.date.today()
-                s = base + datetime.timedelta(days=i * dur_w * 7)
-                e = s + datetime.timedelta(days=dur_w * 7)
-                synth_ms.append({"name": p.get("phase_name") or f"Phase {i+1}", "start": s.isoformat(), "end": e.isoformat(), "duration_days": dur_w * 7})
-            if synth_ms:
-                viz["milestones"] = synth_ms
-                logger.info("Synthesized %d milestones for visualization fallback.", len(synth_ms))
+        lifecycle_png = generate_lifecycle_diagram(viz)
+        if tmpdir and lifecycle_png:
+            try:
+                with open(os.path.join(tmpdir, "lifecycle.png"), "wb") as fh:
+                    fh.write(lifecycle_png)
+            except Exception:
+                logger.exception("Failed saving lifecycle.png")
+        if lifecycle_png and len(lifecycle_png) < 1500:
+            logger.warning("Lifecycle image likely placeholder (empty input or export error). Size=%d bytes", len(lifecycle_png))
     except Exception:
-        logger.exception("Synthesis fallback failed.")
+        logger.exception("Lifecycle generation raised exception.")
 
-    # 6. Check Graphviz presence
+    # 7. Insert images into doc 
     try:
-        if not shutil.which("dot"):
-            logger.error("Graphviz 'dot' binary not found in PATH — diagrams may fail. Install Graphviz and add 'dot' to PATH.")
+
+        if tmpdir and lifecycle_png:
+            try:
+                with open(os.path.join(tmpdir, "lifecycle.png"), "wb") as fh:
+                    fh.write(lifecycle_png)
+            except Exception:
+                logger.exception("Failed saving lifecycle.png")
+        if lifecycle_png and len(lifecycle_png) < 1500:
+            logger.warning("Lifecycle image likely placeholder (empty input or export error). Size=%d bytes", len(lifecycle_png))
+
+        # Вставка lifecycle: вычисляем реальные инчи и корректируем по странице
+                # Вставка lifecycle: вычисляем целевые размеры и корректируем по странице (ширина и высота)
+        if lifecycle_png:
+            w_in, h_in, dpi, orig_w_in, orig_h_in = _compute_target_image_inches(lifecycle_png)
+            if w_in is None:
+                # fallback: стандартная вставка
+                _insert_lifecycle_diagram(doc, lifecycle_png, "{{lifecycle_diagram}}")
+            else:
+                logger.debug("Lifecycle image: orig (in) %s x %s @%sdpi -> target (in) %s x %s",
+                            orig_w_in, orig_h_in, dpi, w_in, h_in)
+                # Передаём ТОЛЬКО width_inches, чтобы сохранить пропорции при вставке.
+                # height_inches=None даст python-docx возможность сохранить пропорции.
+                _insert_lifecycle_diagram(doc, lifecycle_png, "{{lifecycle_diagram}}",
+                                        width_inches=float(w_in), height_inches=None)
+        else:
+            placeholder_png = _placeholder_png_bytes("Lifecycle diagram unavailable", width=800, height=400)
+            _find_and_replace_placeholder_with_image(doc, "{{lifecycle_diagram}}", placeholder_png, width_inches=min(6.5, MAX_PAGE_WIDTH_INCHES), height_inches=None)
+
+
     except Exception:
-        logger.exception("Could not check Graphviz binary presence.")
+        logger.exception("Inserting lifecycle diagram failed.")
 
     # 7. Generate diagrams and save intermediate PNGs for debugging
-    uml_png = gantt_png = None
+    gantt_png = None
     
-    
-    try:
-        uml_png = generate_uml_diagram(viz)
-        if tmpdir and uml_png:
-            try:
-                with open(os.path.join(tmpdir, "uml.png"), "wb") as fh:
-                    fh.write(uml_png)
-            except Exception:
-                logger.exception("Failed saving uml.png")
-        if uml_png and len(uml_png) < 1500:
-            logger.warning("Gantt image likely placeholder (empty input or export error). Size=%d bytes", len(uml_png))
-    except Exception:
-        logger.exception("Gantt generation raised exception.")
     try:
         gantt_png = generate_gantt_image(viz)
         if tmpdir and gantt_png:
@@ -441,20 +549,23 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
         logger.exception("Gantt generation raised exception.")
 
     # 8. Insert images into doc (if present). If missing, insert explicit note
-   
-    try:
-        if uml_png:
-            _insert_image_with_caption(doc, uml_png, "{{uml_diagram}}", caption_text="Figure. UML Diagram.")
-        else:
-            _find_and_replace_placeholder_with_image(doc, "{{uml_diagram}}", _placeholder_png_bytes("Dataflow diagram unavailable"), width_inches=6.5)
-    except Exception:
-        logger.exception("Inserting UML Diagram failed.")
+
 
     try:
         if gantt_png:
-            _insert_image_with_caption(doc, gantt_png, "{{gantt_chart}}", caption_text="Figure. Project Timeline.")
+            w_in, h_in, dpi, orig_w_in, orig_h_in = _compute_target_image_inches(gantt_png)
+            if w_in is None:
+                _insert_image_with_caption(doc, gantt_png, "{{gantt_chart}}")
+            else:
+                logger.debug("Gantt image: orig (in) %s x %s @%sdpi -> target (in) %s x %s",
+                            orig_w_in, orig_h_in, dpi, w_in, h_in)
+                _insert_image_with_caption(doc, gantt_png, "{{gantt_chart}}",
+                                        width_inches=float(w_in), height_inches=None)
         else:
-            _find_and_replace_placeholder_with_image(doc, "{{gantt_chart}}", _placeholder_png_bytes("Gantt chart unavailable"), width_inches=6.5)
+            placeholder_png = _placeholder_png_bytes("Gantt chart unavailable", width=1000, height=500)
+            _find_and_replace_placeholder_with_image(doc, "{{gantt_chart}}", placeholder_png, width_inches=min(7.5, MAX_PAGE_WIDTH_INCHES), height_inches=None)
+
+
     except Exception:
         logger.exception("Inserting gantt failed.")
 
@@ -471,3 +582,27 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
         logger.info("Visualization debug files saved to: %s", tmpdir)
     return out
 
+def _apply_formatting_to_run(paragraph, text_line: str):
+    if not text_line:
+
+        paragraph.add_run("")
+        return
+    parts = re.split(r"(\*\*.*?\*\*|\*.*?\*)", text_line)
+    
+    for part in parts:
+        if not part:
+            continue
+            
+        if part.startswith("**") and part.endswith("**"):
+            # жирный текст
+            text = part[2:-2] # **
+            run = paragraph.add_run(text)
+            run.bold = True
+        elif part.startswith("*") and part.endswith("*"):
+            # курсив
+            text = part[1:-1] 
+            run = paragraph.add_run(text)
+            run.italic = True
+        else:
+            # обычный текст
+            run = paragraph.add_run(part)
