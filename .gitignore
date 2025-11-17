@@ -9,11 +9,7 @@ __pycache__/
 .venv/
 venv/
 env/
-.env.*
-*.env
-# Секреты (самое важное)
-.env
-.env.local
+
 
 # Dependency managers (if used)
 Pipfile
