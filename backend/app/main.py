@@ -13,7 +13,6 @@ from io import BytesIO
 from urllib.parse import quote
 import asyncio
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-from fastapi.responses import Response
 from backend.app.services import visualization_service as vis
 
 
@@ -82,10 +81,24 @@ try:
     def _metrics():
         data = generate_latest()
         return Response(content=data, media_type=CONTENT_TYPE_LATEST)
-    # add ASGI middleware for metrics
-    app.add_middleware_type = getattr(app, "add_middleware", None)
-    # attach middleware manually (works for FastAPI/Starlette)
-    app.middleware("http")(observability.metrics_middleware(app))
+
+    # Register observability middleware correctly.
+    # observability.metrics_middleware may be either:
+    #  - a callable middleware decorator: middleware_fn(request, call_next)
+    #  - a factory that returns middleware when passed the app (less common).
+    try:
+        # If observability exposes a Starlette-compatible middleware class (preferred)
+        if hasattr(observability, "ObservabilityMiddleware"):
+            app.add_middleware(observability.ObservabilityMiddleware)
+        elif hasattr(observability, "metrics_middleware") and callable(observability.metrics_middleware):
+            # If metrics_middleware is a function decorated as @app.middleware style,
+            # register it directly (pass the function, not call it).
+            app.middleware("http")(observability.metrics_middleware)
+        else:
+            logger.info("Observability has no recognized middleware entrypoint; skipping ASGI middleware registration.")
+    except Exception as ex:
+        logger.warning("Failed to register observability middleware: %s", ex)
+
 except Exception:
     import logging
     logging.getLogger(__name__).warning("Observability init failed", exc_info=True)
@@ -101,7 +114,15 @@ app.add_middleware(
 )
 
 
-app.include_router(visualization_router)
+# include visualization router only if it was imported successfully
+if 'visualization_router' in globals() and isinstance(visualization_router, object):
+    try:
+        app.include_router(visualization_router)
+    except Exception as e:
+        logger.warning("Failed to include visualization router: %s", e)
+else:
+    logger.info("Visualization router not available — skipping router inclusion.")
+
 @app.on_event("startup")
 def _on_startup():
     try:
@@ -330,17 +351,27 @@ def _normalize_incoming_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
         for ph in phases:
             if isinstance(ph, dict):
                 name = str(ph.get("phase_name") or ph.get("name") or "").strip() or "Phase"
-                try:
-                    weeks = int(ph.get("duration_weeks") or ph.get("duration") or 1)
-                except Exception:
-                    weeks = 1
+                hours = ph.get("duration_hours")
+                if hours is None:
+                    # Обратная совместимость: конвертируем старые недели в часы
+                    weeks = ph.get("duration_weeks") or ph.get("duration") or 1
+                    try:
+                        hours = int(weeks) * 40
+                    except Exception:
+                        hours = 40  # минимум 1 неделя = 40 часов
+                else:
+                    try:
+                        hours = int(hours)
+                    except Exception:
+                        hours = 40
+
                 tasks = str(ph.get("tasks") or ph.get("description") or "").strip() or "TBD"
                 if len(tasks) < 3:
                     tasks = "TBD"
-                new_ph.append({"phase_name": name, "duration_weeks": weeks, "tasks": tasks})
+                new_ph.append({"phase_name": name, "duration_hours": hours, "tasks": tasks})
             else:
                 name = str(ph) or "Phase"
-                new_ph.append({"phase_name": name, "duration_weeks": 1, "tasks": "TBD"})
+                new_ph.append({"phase_name": name, "duration_hours": 1, "tasks": "TBD"})
     p["phases"] = new_ph
 
     # financials fallback

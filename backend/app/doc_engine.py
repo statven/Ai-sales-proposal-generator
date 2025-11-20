@@ -40,40 +40,46 @@ def _format_currency(value) -> str:
     if value is None or value == "":
         return ""
     try:
-        amount = float(value)
-        formatted_value = locale.format_string("%.2f", amount, grouping=True)
-        return f"{formatted_value}"
+        val = float(value)
+        # Форматируем: 2 знака после запятой, разделитель тысяч - пробел
+        # {:,.2f} дает 10,000.00 -> заменяем запятую на пробел, точку на запятую (русский стандарт)
+        # Или международный стандарт (USD): 10,000.00
+        
+        # Вариант для USD (как в вашем шаблоне):
+        return f"{val:,.2f}".replace(",", " ") # 45 000.00
     except Exception:
-        try:
-            return f"{float(value):,.2f}".replace(',', 'TEMP').replace('.', ',').replace('TEMP', ' ')
-        except Exception:
-            return str(value)
-
+        return str(value)
 # --- Очистка context от повторных подписей/имен компаний ---
 def sanitize_context(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Убирает вхождения client/provider имени в конце больших текстовых полей,
-    чтобы имена компаний появлялись только через соответствующие placeholders.
-    """
-    out = dict(ctx)  # shallow copy
+    out = dict(ctx)
     client = str(out.get("client_company_name") or out.get("client_name") or "").strip()
     provider = str(out.get("provider_company_name") or out.get("provider_name") or "").strip()
 
     if not client and not provider:
         return out
 
-    # regex: удаляет повторяющиеся вхождения имени клиента/провайдера в конце строки
     def _strip_trailing_names(s: str) -> str:
         if not isinstance(s, str) or not s.strip():
             return s
         res = s
-        # удаляем как клиент, так и провайдер если они в конце
+        # Проходимся по обоим именам
         for nm in (client, provider):
-            if not nm:
-                continue
-            res = re.sub(rf"(\r?\n|\s)*{re.escape(nm)}(\s*)$", "", res)
-        # трим пробельные окончания и лишние пустые строки на конце
-        res = re.sub(r"\n{3,}", "\n\n", res).rstrip()
+            if not nm: continue
+            
+            # 1. Экранируем имя для Regex
+            esc_nm = re.escape(nm)
+            
+            # 2. Паттерн: ищет имя в конце, возможно окруженное **, __ или --
+            # (?: ... ) - группировка без захвата
+            # [\*_~-]* - любые markdown символы
+            # \s* - пробелы
+            # $ - конец строки
+            pattern = rf"(\r?\n|\s)*[\*_~-]*{esc_nm}[\*_~-]*[\.,]?\s*$"
+            
+            res = re.sub(pattern, "", res, flags=re.IGNORECASE)
+            
+        # Убираем лишние пустые строки в конце
+        res = res.strip()
         return res
 
     # ключи, которые не трогаем (это сами поля с именами/подписями)
@@ -84,8 +90,7 @@ def sanitize_context(ctx: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     for k, v in list(out.items()):
-        if k in keep:
-            continue
+        if k in keep: continue
         if isinstance(v, str):
             out[k] = _strip_trailing_names(v)
     return out
@@ -275,20 +280,37 @@ def _append_deliverables(table: Table, deliverables: List[Dict[str, str]], max_r
             logger.exception("Failed to add deliverable row")
 
 
-def _append_timeline(table: Table, phases: List[Dict[str, str]], max_rows: int = 200):
+# backend/app/doc_engine.py
+
+def _append_timeline(table: Table, phases: List[Dict[str, Any]], max_rows: int = 200):
     for p in phases[:max_rows]:
         try:
+            hours = int(p.get("duration_hours") or 40)
+            weeks = hours / 40.0
+            
             row = table.add_row()
             cells = row.cells
-            name = p.get("phase_name", "")
-            dur = p.get("duration", p.get("duration_weeks", ""))
-            tasks = p.get("tasks", "")
-            if len(cells) >= 3:
-                cells[0].text = str(name)
-                cells[1].text = str(dur)
-                cells[2].text = str(tasks)
+            
+            name = str(p.get("phase_name", ""))
+            tasks = str(p.get("tasks", ""))
+            
+            # ФОРМАТИРОВАНИЕ ДЛИТЕЛЬНОСТИ
+            # Если дробная часть 0 (например 2.0), пишем "2 weeks", иначе "2.5 weeks"
+            if weeks.is_integer():
+                duration_str = f"{int(weeks)}"
             else:
-                cells[0].text = f"{name} / {dur} / {tasks}"
+                duration_str = f"{weeks:.1f}"
+            
+            # Если хотим добавить слово "weeks" прямо в ячейку (рекомендуется, если в заголовке нет единиц)
+            # duration_str += " weeks" 
+
+            if len(cells) >= 3:
+                cells[0].text = name
+                # Исправление: Пишем просто число, так как заголовок таблицы говорит "Duration (Weeks)"
+                cells[1].text = duration_str 
+                cells[2].text = tasks
+            else:
+                cells[0].text = f"{name} / {duration_str}w / {tasks}"
         except Exception:
             logger.exception("Failed to add timeline row")
 

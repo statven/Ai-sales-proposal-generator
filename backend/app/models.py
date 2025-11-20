@@ -20,8 +20,11 @@ class Deliverable(BaseModel):
     acceptance_criteria: str = Field(..., min_length=2, max_length=1000)  
 
 class Phase(BaseModel):
-    duration_weeks: int = Field(..., ge=1, le=52)
+    duration_hours: int = Field(..., ge=4, le=4000)
     tasks: str = Field(..., min_length=3, max_length=3000)
+    @property
+    def duration_weeks_approx(self) -> float:
+        return round(self.duration_hours / 40.0, 1)
 
 class Financials(BaseModel):
     development_cost: Optional[float] = Field(None, ge=0)
@@ -46,7 +49,7 @@ class ProposalInput(BaseModel):
     deliverables: Optional[List[Deliverable]] = Field(default_factory=list)
     phases: Optional[List[Phase]] = Field(default_factory=list)
     financials: Optional[Financials] = None
-
+    team_size: int = Field(1, ge=1, description="Number of full-time equivalent developers planned for the project.")
     # --- signature fields ---
     client_signature_name: Optional[str] = Field(None)
     client_signature_date: Optional[date] = None

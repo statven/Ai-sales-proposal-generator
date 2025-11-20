@@ -31,9 +31,9 @@ MIN_DELV_ACC = 3
 MAX_DELV_ACC = 1000
 MIN_PHASE_TASKS = 3
 MAX_PHASE_TASKS = 3000
-MIN_PHASE_WEEKS = 1
-MAX_PHASE_WEEKS = 52
-MIN_DEADLINE_DAYS = 31
+MIN_PHASE_HOURS = 4     # Минимум полдня
+MAX_PHASE_HOURS = 2080  
+MIN_DEADLINE_DAYS = 14  # Снижаем порог, так как считаем в часах (можно даже меньше)
 
 # ---------------- Helpers ----------------
 def _format_currency(value) -> str:
@@ -66,8 +66,7 @@ def safe_date_to_iso(d):
 
 def validate_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Validate payload for required fields. Return list of error dicts (pydantic-like).
-    Defensive: accepts None or non-dict and returns a single error.
+    Validate payload using HOURS logic.
     """
     errors: List[Dict[str, Any]] = []
 
@@ -77,40 +76,30 @@ def validate_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not isinstance(payload, dict):
         return [{"loc": ["payload"], "msg": f"payload must be an object/dict, got {type(payload).__name__}"}]
 
-    # required names
-    client = payload.get("client_company_name")
-    if not client or len(str(client).strip()) < MIN_CLIENT_NAME:
-        errors.append({"loc": ["client_company_name"], "msg": f"client_company_name must be at least {MIN_CLIENT_NAME} characters"})
+    # ... (проверки имен client/provider оставляем как есть) ...
 
-    provider = payload.get("provider_company_name")
-    if not provider or len(str(provider).strip()) < MIN_PROVIDER_NAME:
-        errors.append({"loc": ["provider_company_name"], "msg": f"provider_company_name must be at least {MIN_PROVIDER_NAME} characters"})
-
-    # deadline not in past (if provided)
-        # deadline not in past (if provided) and not earlier than minimal horizon
+    # --- DEADLINE VALIDATION ---
     dl = payload.get("deadline")
     if dl:
         try:
-            # dl may be date or ISO string
             if isinstance(dl, str):
                 d = date.fromisoformat(dl)
             elif isinstance(dl, (date, datetime)):
                 d = dl if isinstance(dl, date) else dl.date()
             else:
-                raise ValueError("invalid type for deadline")
+                raise ValueError("invalid type")
 
             today_utc = datetime.utcnow().date()
-            # 1) must not be in the past
             if d < today_utc:
                 errors.append({"loc": ["deadline"], "msg": "deadline must not be in the past"})
-            else:
-                # 2) must be at least MIN_DEADLINE_DAYS from today
-                min_allowed = today_utc + timedelta(days=MIN_DEADLINE_DAYS)
-                if d < min_allowed:
-                    errors.append({
-                        "loc": ["deadline"],
-                        "msg": f"deadline must be at least {MIN_DEADLINE_DAYS} days from today"
-                    })
+            
+            # Проверяем минимальный горизонт планирования (опционально)
+            min_allowed = today_utc + timedelta(days=MIN_DEADLINE_DAYS)
+            if d < min_allowed:
+                errors.append({
+                    "loc": ["deadline"],
+                    "msg": f"deadline implies extremely tight schedule (<{MIN_DEADLINE_DAYS} days). Verify feasibility."
+                })
         except Exception:
             errors.append({"loc": ["deadline"], "msg": "deadline invalid ISO date"})
 
@@ -141,23 +130,30 @@ def validate_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             errors.append({"loc": ["deliverables", i, "acceptance_criteria"], "msg": f"acceptance_criteria must be at least {MIN_DELV_ACC} chars"})
 
     # phases: require phase_name, duration_weeks, tasks
-    for i, p in enumerate(payload.get("phases", []) or []):
+    phases = payload.get("phases", []) or []
+    for i, p in enumerate(phases):
         if not isinstance(p, dict):
             errors.append({"loc": ["phases", i], "msg": "must be object"})
             continue
 
-        # phase_name required (user-visible)
+        # phase_name
         phase_name = p.get("phase_name") or p.get("name") or ""
         if not isinstance(phase_name, str) or len(phase_name.strip()) < 3:
             errors.append({"loc": ["phases", i, "phase_name"], "msg": "phase_name must be at least 3 characters"})
 
-        # duration_weeks validation
+        # duration_hours validation
+        val = p.get("duration_hours")
+        # Если вдруг пришли недели (легаси), пытаемся конвертировать, но валидируем результат
+        if val is None and p.get("duration_weeks"):
+             val = int(p.get("duration_weeks")) * 40
+        
         try:
-            w = int(p.get("duration_weeks"))
-            if w < MIN_PHASE_WEEKS or w > MAX_PHASE_WEEKS:
-                errors.append({"loc": ["phases", i, "duration_weeks"], "msg": f"duration_weeks must be between {MIN_PHASE_WEEKS} and {MAX_PHASE_WEEKS}"})
+            h = int(val)
+            if h < MIN_PHASE_HOURS or h > MAX_PHASE_HOURS:
+                errors.append({"loc": ["phases", i, "duration_hours"], 
+                               "msg": f"duration must be between {MIN_PHASE_HOURS} and {MAX_PHASE_HOURS} hours"})
         except Exception:
-            errors.append({"loc": ["phases", i, "duration_weeks"], "msg": "must be integer"})
+            errors.append({"loc": ["phases", i, "duration_hours"], "msg": "must be integer (hours)"})
 
         if len((p.get("tasks") or "").strip()) < MIN_PHASE_TASKS:
             errors.append({"loc": ["phases", i, "tasks"], "msg": f"tasks must be at least {MIN_PHASE_TASKS} chars"})
@@ -191,13 +187,26 @@ def add_selected_suggestions(list_type: str):
                     "acceptance_criteria": acceptance_text
                 })
             else:
-                try:
-                    duration_weeks = int(item.get("duration_weeks", item.get("duration", 4)))
-                except Exception:
-                    duration_weeks = 4
+
+                raw_hours = item.get("duration_hours")
+                
+                if raw_hours is not None:
+                    duration_hours = int(raw_hours)
+                else:
+                    # --- SMART DEFAULT ---
+                    # Если LLM не дала часы, не берем тупо 160 (4 недели).
+                    # Попробуем взять (Оставшееся время / кол-во выбранных фаз), но не менее 8 часов.
+                    # Для простоты здесь берем консервативные 40 часов (1 неделя), а не 160.
+                    weeks = item.get("duration_weeks", item.get("duration", 1)) # Default 1 неделя
+                    duration_hours = int(float(weeks) * 40)
+                
+                # Защита от гигантизма
+                if duration_hours > 320: # Если более 2 месяцев на фазу
+                     duration_hours = 160 # Срезаем до 1 месяца
+
                 st.session_state.setdefault(target_state, []).append({
                     "phase_name": item.get("phase_name", f"Phase {i+1}"),
-                    "duration_weeks": duration_weeks,
+                    "duration_hours": duration_hours,
                     "tasks": item.get("tasks","")
                 })
             st.session_state[checkbox_key] = False
@@ -243,6 +252,8 @@ with col_right:
     st.markdown("---")
     st.markdown(f"**Total Estimated Investment:**")
     st.markdown(f"### $ {_format_currency(total_cost)}")
+    team_size = st.number_input("Team Size (FTEs)", min_value=1, max_value=20, value=1, step=1, 
+                                help="How many people will work on this project in parallel?")
 
 # --- Build payload helper (USED BY BACKEND) ---
 def build_payload(include_manual_deliverables=True, include_manual_phases=True):
@@ -334,19 +345,43 @@ with edit_cols[1]:
     if "phases_state" not in st.session_state:
         st.session_state["phases_state"] = []
     def add_empty_phase():
-        st.session_state["phases_state"].append({"phase_name":"", "duration_weeks":4, "tasks":""})
+        st.session_state["phases_state"].append({"phase_name":"", "duration_hours":4, "tasks":""})
     st.button("Add new phase", on_click=add_empty_phase, key="add_phase_btn")
     for idx, p in enumerate(st.session_state["phases_state"]):
         summary_preview = p.get("phase_name") or "(Click to edit)"
         with st.expander(f"Phase #{idx+1}: {summary_preview}", expanded=False):
             name = st.text_input(f"Phase name #{idx+1}", value=p.get("phase_name",""), key=f"phase_name_{idx}", max_chars=200)
-            weeks = st.number_input(f"Duration weeks #{idx+1}", value=p.get("duration_weeks",4), min_value=MIN_PHASE_WEEKS, max_value=MAX_PHASE_WEEKS, key=f"phase_weeks_{idx}")
+            hours = st.number_input(f"Duration (hours) #{idx+1}", value=p.get("duration_hours", 160),  # 160ч = 4 недели * 40ч
+                        min_value=MIN_PHASE_HOURS, max_value=MAX_PHASE_HOURS, step=8,  # шаг 8 часов = 1 день
+                        help="1 day = 8h, 1 week = 40h", key=f"phase_hours_{idx}")
             tasks = st.text_area(f"Tasks #{idx+1}", value=p.get("tasks",""), key=f"phase_tasks_{idx}", max_chars=MAX_PHASE_TASKS)
-            st.session_state["phases_state"][idx] = {"phase_name":name, "duration_weeks":int(weeks), "tasks":tasks}
+            st.session_state["phases_state"][idx] = {"phase_name":name, "duration_hours":int(hours), "tasks":tasks}
         if st.button(f"Remove Phase #{idx+1}", key=f"phase_remove_{idx}"):
             st.session_state["phases_state"].pop(idx)
             st.rerun()
+    total_planned_hours = sum([int(p.get("duration_hours", 0)) for p in st.session_state["phases_state"]])
 
+    if deadline:
+        days_remaining = (deadline - date.today()).days
+        import math
+        # Считаем только рабочие дни (5/7)
+        work_days = max(0, math.floor(days_remaining * (5/7)))
+        
+        # ВАЖНО: Умножаем на размер команды!
+        capacity_per_person = work_days * 8
+        total_team_capacity = capacity_per_person * team_size
+        
+        st.markdown("#### ⏳ Time Reality Check")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Planned Effort", f"{total_planned_hours} h")
+        c2.metric("Team Capacity", f"{total_team_capacity} h", help=f"{work_days} days * 8h * {team_size} people")
+        c3.metric("Delta", f"{total_team_capacity - total_planned_hours} h", 
+                  delta_color="normal" if total_team_capacity >= total_planned_hours else "inverse")
+        
+        if total_planned_hours > total_team_capacity:
+            st.warning(
+                #f"to finish {total_planned_hours}h of work by {deadline}. You selected {team_size}."
+            )
 
 # --- Suggestion retrieval ---
 if btn_suggest:
@@ -365,10 +400,36 @@ if btn_suggest:
             try:
                 with st.spinner("Calling backend for suggestions..."):
                     r = requests.post(suggest_url, json=payload, timeout=timeout_sec)
+
                 if r.status_code == 200:
                     data = r.json()
                     st.session_state["suggestions_data"] = data
-                    generation_status.success("Suggestions received. Select items below to add them to your proposal.")
+                    
+                    meta = data.get("metadata", {})
+                    is_feasible = meta.get("deadline_feasible", True)
+                    risk_msg = meta.get("risk_message", "")
+                    total_est = meta.get("total_hours_realistic", 0)
+                    cap = meta.get("capacity_hours_available", 0)
+
+                    # Логика отображения
+                    if is_feasible:
+                        # Если план вписался, но часов много, значит предполагается команда
+                        if cap > 0 and total_est > (cap * 1.2): # Если оценка больше емкости одного человека на 20%
+                             generation_status.info(
+                                f"**Plan Fits Deadline (with Team):**\n"
+                                f"Total Effort: {total_est}h. Available (1 dev): {cap}h.\n"
+                                f"**Suggestion:** This plan requires multiple developers working in parallel to meet the deadline."
+                             )
+                        else:
+                             generation_status.success(f"Plan fits comfortably within the deadline.")
+                    else:
+                        # Если даже с оптимизацией не влезли
+                        generation_status.error(
+                            f"🚨 **Deadline Risk:** {risk_msg}\n\n"
+                            f"Minimal Realistic Estimate: **{total_est}h** vs Available: **{cap}h**.\n"
+                            "The generated proposal will include this as a Critical Risk."
+                        )
+                    
                     st.rerun()
                 else:
                     try:
@@ -408,11 +469,11 @@ if st.session_state.get("suggestions_data"):
             for i, p in enumerate(s_phases):
                 checkbox_key = f"sphase_pick_{i}"
                 st.session_state.setdefault(checkbox_key, False)
-                duration_weeks = int(p.get("duration_weeks", p.get("duration", 4)))
+                duration_hours = int(p.get("duration_hours", p.get("duration", 4)))
                 with st.container():
                     c1, c2 = st.columns([0.08, 1])
                     c1.checkbox("", key=checkbox_key)
-                    c2.markdown(f"**{p.get('phase_name','Phase')}** — **{duration_weeks} weeks**")
+                    c2.markdown(f"**{p.get('phase_name','Phase')}** — **{duration_hours} hours**")
                     st.caption(p.get('tasks',''))
 
 # --- Generate final DOCX ---

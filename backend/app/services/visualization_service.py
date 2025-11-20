@@ -328,10 +328,15 @@ def agent_enrich_schedule(proposal: Dict[str, Any],
             used_names[base_name] = cnt + 1
 
             # duration -> weeks
-            dur_weeks = _parse_duration_to_weeks(it.get("duration_weeks") or it.get("duration") or it.get("duration_days"))
-            # clamp
-            dur_weeks = max(min_weeks, min(max_weeks, int(round(dur_weeks))))
-            duration_days = int(dur_weeks * 7)
+            dur_hours = it.get("duration_hours") or it.get("duration") or (default_week_duration * 40)
+            try:
+                dur_hours = float(dur_hours)
+            except Exception:
+                dur_hours = default_week_duration * 40
+
+            # Конвертируем часы в дни (8ч = 1 день)
+            duration_days = max(1, int(dur_hours / 8.0))
+            dur_weeks = dur_hours / 40.0  # для совместимости с расчётом effort
 
             # 💡 ИЗМЕНЕНИЕ: Логика 'percent_complete'
             try:
@@ -382,9 +387,10 @@ def agent_enrich_schedule(proposal: Dict[str, Any],
                 if it.get("effort_hours") is not None:
                     effort = float(it.get("effort_hours"))
                 else:
-                    effort = float(dur_weeks) * float(hours_per_week)
+                    # FIX: Прямое использование часов, никаких недель
+                    effort = float(dur_hours) 
             except Exception:
-                effort = float(dur_weeks) * float(hours_per_week)
+                effort = float(dur_hours)
 
             _possible_owner_keys = ["owner", "owner_name", "assigned_to", "resource", "responsible", "ownerName"]
             owner_raw = None
