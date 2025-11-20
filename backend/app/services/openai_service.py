@@ -227,6 +227,13 @@ Perform role-specific internal reasoning. For each role, include a short interna
     * Identify and list **project-specific** risks and tie each risk to a **mitigation** and an **owner** (who will take responsibility for mitigation).
     * IMPORTANT: If the **USER-PROVIDED DATA** (the `Provided Phases` or `metadata`) contains a non-empty `dropped_phases` list (or any phases marked removed/priority:"optional"), you MUST add a risk entry for each dropped phase using the pattern:
       `* **Scope Reduction:** [Dropped Phase Name]. **Impact:** <short consequence>. **Mitigation:** <plan>. **Owner:** <role>.`
+        * IMPORTANT: Check `USER-PROVIDED DATA` and `metadata` for overflow/dropped info:
+      - If `metadata.dropped_phases` is non-empty, for each name add a risk entry:
+        `* **Scope Reduction:** [Dropped Phase Name]. **Impact:** <short consequence>. **Mitigation:** <plan>. **Owner:** <role>.`
+      - If `metadata.allow_overflow_used` is true or `metadata.overflow_hours` > 0, add a risk entry:
+        `* **Schedule Overflow:** Plan exceeds available capacity by X hours. **Impact:** Requires additional contractor time or extended deadline. **Mitigation:** Request client approval for +X hours or reduce scope. **Owner:** Project Manager.`
+      - If `deadline_feasible` is false, include a critical risk line clearly stating the hour mismatch and recommended actions.
+
     * Produce `assumptions_text` and `risks_text`. Each bullet MUST be on a new line and risks should use the pattern `* **Risk:** Description. **Mitigation:** ... **Owner:** ...`.
 
     * Produce `assumptions_text`.
@@ -887,16 +894,26 @@ def _build_suggestion_prompt(
     """
     Builds a prompt where all timelines are in hours (1 workday = 8h).
     The returned JSON must use duration_hours and metadata.total_hours_realistic.
-    Additional rule: IF the TRUE estimated hours exceed the computed team capacity,
-    the model MUST remove the least-critical phases and return the list of removed
-    phases in `metadata.dropped_phases` and include an explanatory `metadata.risk_message`.
+
+    New behavior:
+    - If proposal contains "allow_overflow": true, the model may propose a plan that
+      exceeds computed capacity. In that case it MUST set metadata.allow_overflow_requested = true
+      and metadata.allow_overflow_used = true and provide overflow_plan/overflow_hours explaining
+      the extra hours and trade-offs.
+    - If allow_overflow is not requested, the model MAY still propose an overflow plan only as
+      a last resort, but must first return the honest baseline and set deadline_feasible=false,
+      and then place any overflow suggestion separately under metadata.overflow_plan (not mixed with
+      suggested_phases). This makes overflow explicit for downstream decision.
     """
+    import math
+
     deadline_str = proposal.get("deadline", "")
-    team_size = proposal.get("team_size", 1) 
-    
-    total_team_capacity_hours = "null" 
+    team_size = int(proposal.get("team_size", 1) or 1)
+    allow_overflow_requested = bool(proposal.get("allow_overflow", False))
+
+    total_team_capacity_hours = "null"
     used_minimum = False
-    
+
     if deadline_str:
         try:
             deadline_raw = proposal.get("deadline", "")
@@ -906,32 +923,29 @@ def _build_suggestion_prompt(
                 deadline_str = str(deadline_raw)
             deadline_date = datetime.strptime(deadline_str, "%Y-%m-%d").date()
             today = date.today()
-            
+
             if deadline_date > today:
                 time_delta = deadline_date - today
-                
-                # Расчет рабочих дней (5/7)
-                import math
+                # working days (5/7)
                 work_days = max(0, math.floor(time_delta.days * (5/7)))
                 available_hours_single_dev = work_days * 8
-                
-                # *** ГЛАВНАЯ ЛОГИКА: УЧЕТ РАЗМЕРА КОМАНДЫ ***
+
                 total_capacity = available_hours_single_dev * team_size
-                
+
+                # minimum rule (if some time exists, ensure at least 8 hours)
                 if total_capacity < 8 and work_days > 0:
                     used_minimum = True
-                    total_capacity = 8  # Правило: минимум 8 часов
+                    total_capacity = 8
                 elif work_days == 0:
                     total_capacity = 0
 
-                if total_capacity > 0:
-                    total_team_capacity_hours = str(int(total_capacity))
-                else:
-                    total_team_capacity_hours = "0"
+                total_team_capacity_hours = str(int(total_capacity)) if total_capacity is not None else "0"
             else:
                 total_team_capacity_hours = "0"
         except Exception:
             total_team_capacity_hours = "null"
+    else:
+        total_team_capacity_hours = "null"
 
     client = proposal.get("client_company_name") or proposal.get("client_name") or ""
     project_goal = proposal.get("project_goal", "") or proposal.get("goal", "")
@@ -939,13 +953,14 @@ def _build_suggestion_prompt(
     technologies = proposal.get("technologies") or proposal.get("tech") or []
     techs = ", ".join(technologies) if isinstance(technologies, (list, tuple)) else str(technologies)
 
+    # Build instruction: require explicit dropped_phases and overflow metadata
     prompt = f"""
 You are an experienced IT/AI project manager and proposal architect. Produce a concise,
 professional plan (deliverables + phased timeline) that fits the available schedule.
 
 IMPORTANT: You MUST return exactly one valid JSON object and NOTHING ELSE — no explanations,
-no markdown, no commentary. If you output anything other than the single JSON object, it will be
-treated as invalid. 
+no markdown, no commentary.
+
 INPUT DATA:
 - Client: "{client}"
 - Goal: "{project_goal}"
@@ -953,14 +968,14 @@ INPUT DATA:
 - Tech Stack: "{techs}"
 - Hard Deadline Provided: "{deadline_str}"
 - Team Size: {team_size} people
+- MAX TEAM CAPACITY (HOURS): {total_team_capacity_hours}
 
-- **MAX TEAM CAPACITY (HOURS):** {total_team_capacity_hours} (Calculated as 8 working hours/day * 5 days/week * Weeks Available * {team_size})
+ADDITIONAL INPUT FLAG:
+- allow_overflow (boolean): {str(allow_overflow_requested).lower()}
 
 OUTPUT SCHEMA (JSON only):
 {{
-  "suggested_deliverables": [
-    {{ "title": "...", "description": "...", "acceptance": "..." }}
-  ],
+  "suggested_deliverables": [ {{ "title": "...", "description": "...", "acceptance": "..." }} ],
   "suggested_phases": [
     {{
       "phase_name": "...",
@@ -976,44 +991,50 @@ OUTPUT SCHEMA (JSON only):
     "deadline_feasible": <BOOLEAN>,
     "risk_message": "<String: warning message if not feasible, else empty>",
     "used_minimum_deadline": <BOOLEAN>,
-    "dropped_phases": [ "<phase_name>", ... ]   // MUST list names of phases removed to fit deadline (can be empty)
+    "dropped_phases": [ "<phase_name>", ... ],
+    "allow_overflow_requested": {str(allow_overflow_requested).lower()},
+    "allow_overflow_used": <BOOLEAN>,            // true if the returned primary plan exceeds capacity
+    "overflow_hours": <INTEGER>,                // number of hours beyond capacity (0 if none)
+    "overflow_plan": "<STRING or short object explaining the overflow plan and trade-offs>" 
   }}
 }}
 
-CRITICAL ADDITIONAL RULE (DROP-TO-FIT BEHAVIOR):
-1. Compute the TRUE realistic effort for the full scope (baseline) and set `total_hours_realistic`.
-2. Compare Baseline vs Capacity (`capacity_hours_available` = {total_team_capacity_hours}).
-3. If Baseline <= Capacity:
-   - Return suggested_phases covering the scope; set "deadline_feasible": true and "dropped_phases": [].
-4. If Baseline > Capacity:
-   - FIRST, try to **re-scope**: remove or move **optional** phases (lowest priority) to a `dropped_phases` list until the sum of remaining `duration_hours` <= Capacity.
-   - SECOND, if necessary, compress "should" phases to realistic minimums (but never below 4 hours per phase) and recalc.
-   - THIRD, if after removing all optional and compressing "should" phases the plan still exceeds Capacity, then:
-       a) set "deadline_feasible": false,
-       b) return the full honest baseline (all phases and their true `duration_hours`) in `suggested_phases`,
-       c) set `metadata.dropped_phases` = [] and put a clear mismatch in `risk_message` explaining "requires Xh but only Yh available".
-   - When you **do** remove phases to fit the deadline, ensure:
-       * Removed phases are NOT present in `suggested_phases`.
-       * Their names are included in `metadata.dropped_phases` (array of strings).
-       * Set `deadline_feasible` = true (because the *new* plan fits) and put a short `risk_message` like: "Scope reduced: dropped [A, B] to fit deadline; see trade-offs."
-5. Always include `priority` for each returned phase ("must" for MVP items).
-6. Phase durations must be integers >= 4 hours.
-7. The sum of `duration_hours` must equal metadata.total_hours_realistic.
-8. If you removed phases, include a one-line justification for each removed phase inside `metadata.risk_message` (comma-separated short phrases).
+CRITICAL RULES (order of operations):
+1) Compute an HONEST baseline estimate: realistic hours for the full scope -> set metadata.total_hours_realistic.
+2) Compare baseline vs capacity (metadata.capacity_hours_available = {total_team_capacity_hours}).
+3) If baseline <= capacity:
+    - Return the plan in suggested_phases, set deadline_feasible = true, dropped_phases = [], allow_overflow_used = false, overflow_hours = 0.
+4) If baseline > capacity:
+    A) FIRST: attempt to fit by REMOVING optional phases (priority == "optional"). Move removed names to metadata.dropped_phases.
+    B) SECOND: if still over capacity, compress "should" phases to realistic minimums (>=4h) where possible.
+    C) If after A+B the plan fits capacity:
+         - Return the reduced plan in suggested_phases, set deadline_feasible = true, allow_overflow_used = false, overflow_hours = 0,
+         - risk_message must list dropped phases and brief trade-offs.
+    D) If after removing/compressing the plan STILL EXCEEDS capacity:
+         - If allow_overflow was explicitly requested (allow_overflow=true in INPUT), you MAY return a plan that exceeds capacity:
+             * set allow_overflow_used = true,
+             * set overflow_hours = total_hours_realistic - capacity_hours_available (integer),
+             * include overflow_plan explaining required extra hours, why they are necessary, what will be deprioritized if overflow is not accepted,
+             * set deadline_feasible = true (because the plan is deliverable if extra hours/resources are accepted), and
+             * set risk_message describing trade-offs and recommendation ("Accept overflow X hours or extend deadline or reduce scope A,B").
+         - ELSE (no allow_overflow request): YOU MUST NOT silently return an overflow plan as the main suggested_phases.
+             * Instead set deadline_feasible = false,
+             * return the honest baseline in suggested_phases,
+             * set allow_overflow_used = false,
+             * set overflow_hours = metadata.total_hours_realistic - capacity_hours_available,
+             * set metadata.overflow_plan to a separate suggested overflow plan (clear text/object),
+             * risk_message MUST include exact mismatch like: "Baseline requires {{" + "total_hours_realistic" + "}}h but only {total_team_capacity_hours}h available."
+5) Phase durations must be integers >= 4 hours. Sum of durations must equal metadata.total_hours_realistic.
+6) If you removed phases to fit capacity, ensure removed phases are NOT present in suggested_phases and ARE listed in metadata.dropped_phases.
+7) Always fill metadata.used_minimum_deadline true/false if you applied the minimum 8-hour rule.
 
-STRATEGY SUMMARY (strict order of application):
-A) Calculate honest baseline (realistic hours).
-B) Try to fit by removing optional phases.
-C) If still over, compress "should" phases but never below 4h each.
-D) If still over, report honest baseline and set `deadline_feasible`: false.
+VALIDATION BEFORE RETURN:
+- Ensure numeric fields are integers.
+- Ensure len(suggested_phases) <= {max_phases} and len(suggested_deliverables) <= {max_deliverables}.
+- Ensure metadata.total_hours_realistic equals sum(suggested_phases.duration_hours).
+- Ensure metadata contains dropped_phases, overflow_plan, overflow_hours, allow_overflow_used, allow_overflow_requested.
 
-VALIDATION BEFORE RETURN (self-check):
-- Ensure schema keys exist exactly as above.
-- Ensure all numbers are integers.
-- Ensure `len(suggested_phases) <= {max_phases}` and `len(suggested_deliverables) <= {max_deliverables}`.
-- Ensure `total_hours_realistic` equals the sum of `duration_hours`.
-- Ensure `metadata.dropped_phases` is present (can be empty list).
-
-Return only the JSON object — absolutely no extra text.
+Return only the single JSON object — absolutely no extra text.
 """
     return prompt.strip()
+
