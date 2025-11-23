@@ -380,7 +380,7 @@ with edit_cols[1]:
         
         if total_planned_hours > total_team_capacity:
             st.warning(
-                #f"to finish {total_planned_hours}h of work by {deadline}. You selected {team_size}."
+                f"⚠️ Overload: You need to finish {total_planned_hours}h of work by {deadline}, but you only have {total_team_capacity}h capacity. You selected Team Size: {team_size}."
             )
 
 # --- Suggestion retrieval ---

@@ -21,7 +21,7 @@ from typing import Dict, Any, Tuple, Optional, List
 from datetime import date, datetime, timedelta
 
 from functools import lru_cache, wraps
-import requests # Для сетевых ошибок в requests (хотя здесь используется client, все равно полезно)
+import requests
 
 # try import openai
 try:
@@ -35,7 +35,6 @@ except Exception:
 # try import gemini
 try:
     import google.generativeai as genai
-    # Импортируем специфические ошибки Gemini
     from google.api_core.exceptions import GoogleAPIError as GeminiAPIError, ResourceExhausted as GeminiRateLimitError
 except Exception:
     genai = None
@@ -45,7 +44,6 @@ logger = logging.getLogger("uvicorn.error")
 
 # --- ENV / configuration ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# FIX 1: Используем JSON-совместимую модель по умолчанию
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo-0125") 
 OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", OPENAI_MODEL)
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "1000"))
@@ -57,7 +55,7 @@ OPENAI_USE_STUB = os.getenv("OPENAI_USE_STUB", "0").lower() in ("1", "true", "ye
 
 # Gemini (Google AI) fallback
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash") # Используем быструю модель
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash") 
 
 # If module-level api_key attribute exists, set it for best-effort compatibility
 if openai is not None and OPENAI_API_KEY:
@@ -332,10 +330,6 @@ Perform role-specific internal reasoning. For each role, include a short interna
 
 def _extract_text_from_openai_response(resp: Any) -> str:
 
-    """
-    Always return a JSON/text string. If the client returned structured content (dict/list),
-    dump to JSON string. Fallback to str(resp).
-    """
     try:
         # handle new-client structured response
         if isinstance(resp, dict):
