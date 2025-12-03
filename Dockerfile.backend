@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1
 ENV APP_HOME=/app
 WORKDIR $APP_HOME
 
-# Установим системные зависимости, нужные для docx/plotly/kaleido/requests и т.д.
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     liblzma-dev \
@@ -22,17 +22,16 @@ RUN apt-get update && apt-get install -y locales && \
 
 ENV LANG ru_RU.UTF-8
 ENV LC_ALL ru_RU.UTF-8
-# Копируем зависимости и ставим (если у тебя один файл requirements.txt — оставь его)
+
 COPY backend/requirements.txt ./requirements-backend.txt
 RUN pip install --no-cache-dir -r ./requirements-backend.txt
 
-# Копируем весь backend в контейнер
+
 COPY backend/ ./backend/
 
 # Копируем шаблон, если хочешь включить его в образ; в compose лучше монтировать локально
 # COPY docs/template.docx ./docs/template.docx
 
-# Установим PYTHONPATH чтобы python видел пакет backend
 ENV PYTHONPATH=/app
 
 # Папка для базы данных

@@ -12,15 +12,18 @@ from docx.shared import Inches
 from docx.table import Table
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from PIL import Image, ImageDraw, ImageFont
+from datetime import date, datetime # <-- Добавлен импорт date/datetime
 
 DEFAULT_TARGET_DPI = 300
 MAX_PAGE_WIDTH_INCHES = 7.3
-MAX_PAGE_HEIGHT_INCHES = 8.3 
+MAX_PAGE_HEIGHT_INCHES = 8
 # --- Импорт безопасных генераторов диаграмм ---
 from backend.app.services.visualization_service import (
     generate_gantt_image,
     generate_lifecycle_diagram,
+    generate_uml_diagram,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -41,91 +44,204 @@ def _format_currency(value) -> str:
         return ""
     try:
         val = float(value)
-        # Форматируем: 2 знака после запятой, разделитель тысяч - пробел
-        # {:,.2f} дает 10,000.00 -> заменяем запятую на пробел, точку на запятую (русский стандарт)
-        # Или международный стандарт (USD): 10,000.00
-        
-        # Вариант для USD (как в вашем шаблоне):
-        return f"{val:,.2f}".replace(",", " ") # 45 000.00
+        # 2 decimals, thousands separator = space, keep decimal dot (USD)
+        s = f"{val:,.2f}"
+        # replace comma thousands sep with space (so "10,000.00" -> "10 000.00")
+        s = s.replace(",", " ")
+        return s
     except Exception:
         return str(value)
-# --- Очистка context от повторных подписей/имен компаний ---
+def _format_date_english(date_obj: date) -> str:
+    """
+    Форматирует объект date/datetime в строку на английском языке
+    (например, 'December 2, 2025'), игнорируя текущую русскую локаль.
+    
+    Внимание: Для корректной работы на разных ОС могут понадобиться разные
+    идентификаторы локали ('en_US.UTF-8', 'English_United States', 'C').
+    """
+    if not isinstance(date_obj, (date, datetime)):
+        # В случае, если передан не объект даты, возвращаем его строковое представление
+        return str(date_obj) 
+
+    # 1. Сохраняем текущую локаль (она должна быть русской)
+    original_locale = locale.getlocale(locale.LC_ALL)
+    formatted_date = date_obj.isoformat() # Fallback
+
+    # 2. Попытка установить английскую локаль для форматирования
+    try:
+        # Пытаемся установить локаль 'en_US.UTF-8'
+        locale.setlocale(locale.LC_ALL, 'en_US.UTF-8') 
+    except locale.Error:
+        try:
+            # Попытка для Windows/других систем
+            locale.setlocale(locale.LC_ALL, 'English_United States')
+        except locale.Error:
+            # Fallback: Если не удалось, оставляем оригинальную локаль, но используем
+            # ISO-формат для английского (YYYY-MM-DD) или другой строгий формат.
+            logger.warning("Could not temporarily set English locale for date formatting. Using ISO format.")
+            return date_obj.strftime("%B %d, %Y") # Пробуем, но скорее всего будет русский
+
+    # 3. Формат даты на английском языке
+    # %B - Full month name (English), %d - Day of month, %Y - Year
+    formatted_date = date_obj.strftime("%B %d, %Y")
+    
+    # 4. Восстанавливаем оригинальную локаль (русскую)
+    try:
+        locale.setlocale(locale.LC_ALL, original_locale)
+    except locale.Error:
+        logger.warning("Could not restore original locale after English date formatting.")
+
+    return formatted_date
 def sanitize_context(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(ctx)
-    client = str(out.get("client_company_name") or out.get("client_name") or "").strip()
-    provider = str(out.get("provider_company_name") or out.get("provider_name") or "").strip()
+    """
+    Clean up context:
+    - remove trailing occurrences of client/provider names (signatures, repeated mentions).
+    - collapse immediate repeated mentions like "Company X Company X" or "Company X, Company X".
+    - do NOT touch special keys in KEEP_KEYS (these are authoritative fields).
+    """
+    out = dict(ctx)  # shallow copy so we don't modify original directly
 
-    if not client and not provider:
-        return out
+    client = (out.get("client_company_name") or out.get("client_name") or "") or ""
+    provider = (out.get("provider_company_name") or out.get("provider_name") or "") or ""
+    client = str(client).strip()
+    provider = str(provider).strip()
 
-    def _strip_trailing_names(s: str) -> str:
-        if not isinstance(s, str) or not s.strip():
-            return s
-        res = s
-        # Проходимся по обоим именам
-        for nm in (client, provider):
-            if not nm: continue
-            
-            # 1. Экранируем имя для Regex
-            esc_nm = re.escape(nm)
-            
-            # 2. Паттерн: ищет имя в конце, возможно окруженное **, __ или --
-            # (?: ... ) - группировка без захвата
-            # [\*_~-]* - любые markdown символы
-            # \s* - пробелы
-            # $ - конец строки
-            pattern = rf"(\r?\n|\s)*[\*_~-]*{esc_nm}[\*_~-]*[\.,]?\s*$"
-            
-            res = re.sub(pattern, "", res, flags=re.IGNORECASE)
-            
-        # Убираем лишние пустые строки в конце
-        res = res.strip()
-        return res
-
-    # ключи, которые не трогаем (это сами поля с именами/подписями)
-    keep = {
+    # keys to preserve untouched
+    KEEP_KEYS = {
         "client_company_name", "client_name", "client_signature_name",
         "provider_company_name", "provider_name", "provider_signature_name",
         "client_signature_date", "provider_signature_date"
     }
 
+    # helper: remove trailing "ClientName" or "ProviderName" with optional markdown decorators and trailing punctuation/spaces
+    def _strip_trailing_names_from_string(s: str, names: List[str]) -> str:
+
+        if not isinstance(s, str) or not s.strip() or not names:
+            return s
+
+        # Нормализуем имена для сравнения (приводим к нижнему регистру, убираем лишние пробелы)
+        normalized_names = [re.escape(nm.strip()) for nm in names if nm and nm.strip()]
+
+        if not normalized_names:
+            return s
+
+        # 1. Удаляем trailing строки, состоящие ТОЛЬКО из имени компании (с любыми markdown/пунктуацией)
+        lines = s.split('\n')
+        changed = True
+        while changed and lines:
+            changed = False
+            last_line = lines[-1].strip()
+
+            # Удаляем все не-буквенные символы для проверки «это чистое имя?»
+            cleaned = re.sub(r'[^\w\s]', '', last_line)  # оставляем только буквы, цифры, пробелы
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+            if any(re.fullmatch(norm_name, cleaned, flags=re.IGNORECASE) for norm_name in normalized_names):
+                lines.pop()
+                changed = True
+            elif any(cleaned.lower() == re.sub(r'\s+', ' ', nm.lower()) for nm in names if nm):
+                lines.pop()
+                changed = True
+
+        text = '\n'.join(lines)
+
+        # 2. Удаляем trailing имя в конце всего текста (с markdown, пунктуацией и пробелами)
+        pattern = rf'(?:[\s*_\-\.~,.;:!?]*)(?:{"|".join(normalized_names)})(?:[\s*_\-\.~,.;:!?]*)$'
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE).strip()
+
+        # 3. Убираем дубликаты имён подряд (например, "Company\nCompany" или "Company, Company")
+        for nm in names:
+            if not nm:
+                continue
+            esc = re.escape(nm.strip())
+            # Повторения через запятые, точки, пробелы и переносы
+            text = re.sub(rf'({esc})\s*[,;:.]?\s*\1', r'\1', text, flags=re.IGNORECASE)
+
+        return text.strip()
+    # Apply to each string field except KEEP_KEYS
     for k, v in list(out.items()):
-        if k in keep: continue
+        if k in KEEP_KEYS:
+            continue
         if isinstance(v, str):
-            out[k] = _strip_trailing_names(v)
+            out[k] = _strip_trailing_names_from_string(v, [client, provider])
+
     return out
+
+def _insert_uml_diagram(doc: Document, image_bytes: bytes, placeholder: str, 
+                        width_inches: float = 6.5, height_inches: Optional[float] = None):
+    """
+    Вставляет UML-диаграмму в документ в место плейсхолдера {{uml_diagram}}.
+    Если плейсхолдер не найден — добавляет в конец документа.
+    """
+    inserted = _find_and_replace_placeholder_with_image(doc, placeholder, image_bytes, width_inches, height_inches)
+    if not inserted:
+        p = doc.add_paragraph()
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        run = p.add_run()
+        try:
+            if height_inches:
+                run.add_picture(BytesIO(image_bytes), width=Inches(width_inches), height=Inches(height_inches))
+            else:
+                run.add_picture(BytesIO(image_bytes), width=Inches(width_inches))
+        except Exception:
+            p.add_run("[UML image could not be embedded]")
 
 # --- Вспомогательные функции замены текста ---
 def _replace_in_paragraph(paragraph, mapping: Dict[str, str]) -> None:
     """
-    Надёжная замена: склеиваем runs, заменяем (ключи по убыванию длины),
-    очищаем run'ы и добавляем один run с результирующим текстом.
+    Replace placeholders like {{key}} inside a paragraph.
+    This version:
+    - builds full_text from runs
+    - performs replacements deterministically (keys by length desc)
+    - clears original runs and inserts formatted lines using _apply_formatting_to_run
     """
     full_text = "".join(run.text for run in paragraph.runs)
     if not full_text:
         return
 
-    new_text = full_text
-    replaced = False
-    matched_keys: List[str] = []
+    # ensure mapping values are strings
+    safe_map = {str(k): ("" if v is None else str(v)) for k, v in mapping.items()}
 
-    # сортируем ключи по длине — чтобы исключить проблемы типа 'title' и 'project_title'
-    for k in sorted(mapping.keys(), key=lambda x: -len(x)):
-        v = mapping.get(k, "")
+    # quick check for any placeholder existence to avoid unnecessary ops
+    if "{{" not in full_text:
+        return
+
+    new_text = full_text
+    replaced_keys = []
+    # replace longer keys first
+    for k in sorted(safe_map.keys(), key=lambda x: -len(x)):
         ph = f"{{{{{k}}}}}"
         if ph in new_text:
-            new_text = new_text.replace(ph, v or "")
-            replaced = True
-            matched_keys.append(k)
+            new_text = new_text.replace(ph, safe_map[k])
+            replaced_keys.append(k)
 
-    if matched_keys:
-        logger.info("[DOC_ENGINE] Paragraph %s matched keys: %s", hex(id(paragraph)), matched_keys)
+    if not replaced_keys:
+        return
 
-    if replaced and new_text != full_text:
-        for run in paragraph.runs:
-            run.text = ""
-        paragraph.add_run(new_text)
-        logger.debug("[DOC_ENGINE] AFTER_REPLACE paragraph id=%s new_text=%r", hex(id(paragraph)), new_text)
+    logger.info("[DOC_ENGINE] Paragraph %s replaced keys: %s", hex(id(paragraph)), replaced_keys)
+
+    # clear existing runs
+    for r in paragraph.runs:
+        r.text = ""
+
+    # split into lines and re-create runs preserving simple markup
+    lines = new_text.split("\n")
+    # apply formatting to first line on the same paragraph
+    _apply_formatting_to_run(paragraph, lines[0] if lines else "")
+    # insert additional paragraphs after current paragraph
+    anchor = paragraph._p
+    for line in lines[1:]:
+        new_p = paragraph._parent.add_paragraph()  # add to same container (section/table cell)
+        # preserve paragraph style if any
+        try:
+            new_p.style = paragraph.style
+        except Exception:
+            pass
+        _apply_formatting_to_run(new_p, line)
+        anchor.addnext(new_p._p)
+        anchor = new_p._p
+
+
 
 
 def _replace_in_table(table: Table, mapping: Dict[str, str]) -> None:
@@ -285,34 +401,71 @@ def _append_deliverables(table: Table, deliverables: List[Dict[str, str]], max_r
 def _append_timeline(table: Table, phases: List[Dict[str, Any]], max_rows: int = 200):
     for p in phases[:max_rows]:
         try:
-            hours = int(p.get("duration_hours") or 40)
-            weeks = hours / 40.0
+            # Логика приоритетов:
+            hours = p.get("duration_hours")
             
+            # Если нет hours, ищем duration (иногда приходит как строка "180" или "180 hours")
+            if hours is None:
+                raw_dur = p.get("duration")
+                if raw_dur:
+                    try:
+                        # Пытаемся вытащить первое число из строки
+                        import re
+                        nums = re.findall(r'\d+', str(raw_dur))
+                        if nums:
+                            hours = int(nums[0])
+                    except:
+                        pass
+            
+            # Если всё ещё None, ищем недели
+            if hours is None and p.get("duration_weeks"):
+                try:
+                    hours = int(float(p["duration_weeks"]) * 40)
+                except:
+                    pass
+
+            # Финальный фоллбэк только если совсем ничего нет
+            if hours is None:
+                hours = 40 
+
+            # Расчет недель для отображения
+            weeks = round(hours / 40.0, 1)
+            if weeks.is_integer():
+                weeks_str = f"{int(weeks)} w"
+            else:
+                weeks_str = f"{weeks} w"
+                
+            duration_str = f"{hours} h ({weeks_str})"
+            
+
+            name = str(p.get("phase_name", "")).strip()
+            tasks = str(p.get("tasks", "")).strip()
+            owner = str(p.get("owner", "")).strip()
+            priority = str(p.get("priority", "")).strip()
+
             row = table.add_row()
             cells = row.cells
-            
-            name = str(p.get("phase_name", ""))
-            tasks = str(p.get("tasks", ""))
-            
-            # ФОРМАТИРОВАНИЕ ДЛИТЕЛЬНОСТИ
-            # Если дробная часть 0 (например 2.0), пишем "2 weeks", иначе "2.5 weeks"
-            if weeks.is_integer():
-                duration_str = f"{int(weeks)}"
-            else:
-                duration_str = f"{weeks:.1f}"
-            
-            # Если хотим добавить слово "weeks" прямо в ячейку (рекомендуется, если в заголовке нет единиц)
-            # duration_str += " weeks" 
 
             if len(cells) >= 3:
                 cells[0].text = name
-                # Исправление: Пишем просто число, так как заголовок таблицы говорит "Duration (Weeks)"
-                cells[1].text = duration_str 
-                cells[2].text = tasks
+                cells[1].text = duration_str
+                if owner:
+                    cells[2].text = f"{tasks}\n\nOwner: {owner}"
+                else:
+                    cells[2].text = tasks
+                if priority:
+                    cells[2].text += f"\n\nPriority: {priority}"
             else:
-                cells[0].text = f"{name} / {duration_str}w / {tasks}"
+                compact = f"{name} — {duration_str}\n{tasks}"
+                if owner:
+                    compact += f"\nOwner: {owner}"
+                if priority:
+                    compact += f"\nPriority: {priority}"
+                cells[0].text = compact
         except Exception:
             logger.exception("Failed to add timeline row")
+
+
 
 def _placeholder_png_bytes(text: str = "Diagram unavailable", width: int = 800, height: int = 400) -> bytes:
     img = Image.new("RGB", (width, height), color=(255, 255, 255))
@@ -367,7 +520,8 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
         # 1. Prepare mapping (currency formatting preserved)
     # Сначала чистим context от лишних подписей
     context = sanitize_context(context)
-
+    today = date.today()
+    context['current_date'] = _format_date_english(today)
     mapping = {}
     for k, v in context.items():
         if k in ("development_cost", "licenses_cost", "support_cost", "total_investment_cost"):
@@ -389,39 +543,21 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
 
 
 
-    # 2. Replace placeholders in paragraphs and tables
-    original_paragraphs = list(doc.paragraphs)
-    
-    for p in original_paragraphs:
-        
-        full_text = "".join(run.text for run in p.runs)
+        # 2. Replace placeholders in the document (paragraphs, tables, headers, footers)
+    # Мы используем ЕДИНУЮ функцию, которая корректно обрабатывает \n → новые параграфы
+    for paragraph in doc.paragraphs:
+        _replace_in_paragraph(paragraph, mapping)
 
-        if "{{" not in full_text:
-            continue # Нет плейсхолдеров, пропускаем
+    for table in doc.tables:
+        _replace_in_table(table, mapping)
 
-
-        new_full_text = full_text
-        has_replacement = False
-        for k, v in mapping.items():
-            ph = f"{{{{{k}}}}}"
-            if ph in new_full_text:
-                new_full_text = new_full_text.replace(ph, v) # 'v' уже строка
-                has_replacement = True
-        
-        if not has_replacement:
-            continue
-        for r in p.runs:
-            r.text = ""
-        lines = new_full_text.split('\n')
-        _apply_formatting_to_run(p, lines[0] if lines else "")
-            
-        anchor_element = p._p 
-        
-        for line in lines[1:]:
-            new_p = doc.add_paragraph()
-            _apply_formatting_to_run(new_p, line)
-            anchor_element.addnext(new_p._p)
-            anchor_element = new_p._p
+    for section in doc.sections:
+        for container in [section.header, section.footer, section.first_page_header, section.first_page_footer]:
+            if container:
+                for paragraph in container.paragraphs:
+                    _replace_in_paragraph(paragraph, mapping)
+                for table in container.tables:
+                    _replace_in_table(table, mapping)
 
 
 
@@ -483,6 +619,8 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
         vis["infrastructure"] = pick(raw, "infrastructure", "infra", "servers", "hosts") or ctx.get("infrastructure") or []
         vis["connections"] = pick(raw, "connections", "links", "network") or ctx.get("connections") or []
         vis["milestones"] = pick(raw, "milestones", "timeline", "phases") or ctx.get("phases_list") or ctx.get("milestones") or []
+        vis["team_context"] = ctx.get("team_structure_text") or ctx.get("team_structure") or ctx.get("team_roles") or ""
+        
         return vis
 
     viz = _normalize_visualization_local(context)
@@ -569,6 +707,40 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
             logger.warning("Gantt image likely placeholder (empty input or export error). Size=%d bytes", len(gantt_png))
     except Exception:
         logger.exception("Gantt generation raised exception.")
+        # 7.b Generate UML diagram (agent-mode fallback)
+    uml_png = None
+    try:
+        logger.debug("Visualization data for UML diagram: %s", json.dumps(viz, ensure_ascii=False))
+        # Call agent-mode UML generator (will fallback deterministically if LLM unavailable)
+        uml_png = generate_uml_diagram(viz)
+        if tmpdir and uml_png:
+            try:
+                with open(os.path.join(tmpdir, "uml.png"), "wb") as fh:
+                    fh.write(uml_png)
+            except Exception:
+                logger.exception("Failed saving uml.png")
+        if uml_png and len(uml_png) < 1500:
+            logger.warning("UML image likely placeholder (empty input or export error). Size=%d bytes", len(uml_png))
+    except Exception:
+        logger.exception("UML generation raised exception.")
+
+    # Insert UML into doc
+    try:
+        if uml_png:
+            w_in, h_in, dpi, orig_w_in, orig_h_in = _compute_target_image_inches(uml_png)
+            if w_in is None:
+                # fallback simple insert
+                _insert_uml_diagram(doc, uml_png, "{{uml_diagram}}")
+            else:
+                logger.debug("UML image: orig (in) %s x %s @%sdpi -> target (in) %s x %s",
+                            orig_w_in, orig_h_in, dpi, w_in, h_in)
+                _insert_uml_diagram(doc, uml_png, "{{uml_diagram}}",
+                                    width_inches=float(min(w_in, MAX_PAGE_WIDTH_INCHES)), height_inches=None)
+        else:
+            placeholder_png = _placeholder_png_bytes("UML diagram unavailable", width=1000, height=420)
+            _find_and_replace_placeholder_with_image(doc, "{{uml_diagram}}", placeholder_png, width_inches=min(6.5, MAX_PAGE_WIDTH_INCHES), height_inches=None)
+    except Exception:
+        logger.exception("Inserting UML diagram failed.")
 
     # 8. Insert images into doc (if present). If missing, insert explicit note
 
@@ -605,26 +777,35 @@ def render_docx_from_template(template_path: str, context: Dict[str, Any]) -> By
     return out
 
 def _apply_formatting_to_run(paragraph, text_line: str):
-    if not text_line:
+    """
+    Apply basic markdown-like formatting for **bold** and *italic*.
+    Handles multiple occurrences in the same line.
+    Does not attempt to parse nested or malformed markup.
+    """
+    if text_line is None:
+        text_line = ""
+    text_line = str(text_line)
 
-        paragraph.add_run("")
-        return
-    parts = re.split(r"(\*\*.*?\*\*|\*.*?\*)", text_line)
-    
-    for part in parts:
-        if not part:
-            continue
-            
-        if part.startswith("**") and part.endswith("**"):
-            # жирный текст
-            text = part[2:-2] # **
-            run = paragraph.add_run(text)
-            run.bold = True
-        elif part.startswith("*") and part.endswith("*"):
-            # курсив
-            text = part[1:-1] 
-            run = paragraph.add_run(text)
-            run.italic = True
-        else:
-            # обычный текст
-            run = paragraph.add_run(part)
+    # pattern finds either **bold** or *italic*; non-greedy.
+    pattern = re.compile(r"(\*\*(.+?)\*\*|\*(.+?)\*)")
+
+    last_idx = 0
+    for m in pattern.finditer(text_line):
+        start, end = m.span()
+        # plain text before match
+        if start > last_idx:
+            paragraph.add_run(text_line[last_idx:start])
+        # determine which group matched
+        bold_text = m.group(2)
+        italic_text = m.group(3)
+        if bold_text is not None:
+            r = paragraph.add_run(bold_text)
+            r.bold = True
+        elif italic_text is not None:
+            r = paragraph.add_run(italic_text)
+            r.italic = True
+        last_idx = end
+
+    # tail
+    if last_idx < len(text_line):
+        paragraph.add_run(text_line[last_idx:])

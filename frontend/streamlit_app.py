@@ -33,7 +33,7 @@ MIN_PHASE_TASKS = 3
 MAX_PHASE_TASKS = 3000
 MIN_PHASE_HOURS = 4     # Минимум полдня
 MAX_PHASE_HOURS = 2080  
-MIN_DEADLINE_DAYS = 14  # Снижаем порог, так как считаем в часах (можно даже меньше)
+MIN_DEADLINE_DAYS = 7
 
 # ---------------- Helpers ----------------
 def _format_currency(value) -> str:
@@ -216,9 +216,45 @@ def add_selected_suggestions(list_type: str):
         st.rerun()
 
 # ---------------- UI ----------------
+
 st.set_page_config(page_title="AI Sales Proposal Generator", layout="wide")
 st.title("AI Sales Proposal Generator ")
+st.markdown("---")
+with st.expander("📖 **User Guide: How to create a winning proposal**", expanded=False):
+    st.markdown("""
+    ### Welcome to the AI Sales Proposal Generator
+    This tool streamlines the creation of commercial proposals (SOWs) by combining structured data input with Large Language Model (LLM) reasoning. Follow this workflow to generate high-quality documents.
 
+    #### 1. Configuration (Sidebar)
+    * **API Connection:** Ensure the Backend URL is correct (default: `http://localhost:8000`).
+    * **Timeout:** Increase this value if you are generating complex proposals with slow LLM models.
+
+    #### 2. Project Initialization
+    * **Core Details:** Enter the Client and Provider names exactly as they should appear in the contract.
+    * **Scope & Goal:** Be specific. The AI uses the "Scope" field as the primary source of truth for generating deliverables.
+    * **Tone:** Select the voice of the document (e.g., *Formal* for enterprise, *Marketing* for agencies).
+    * **Financials & Team:** Set your budget and team size. This data calculates the ROI and project feasibility.
+
+    #### 3. AI-Assisted Planning (Recommended)
+    Instead of writing everything from scratch, let the AI do the heavy lifting:
+    1.  Click **`Get LLM suggestions`**.
+    2.  Wait for the AI to analyze your Scope and Deadline.
+    3.  Review the **Suggested Deliverables** and **Phases** that appear below.
+    4.  Check the boxes next to the items you like and click **`➕ Add Selected...`**. This moves them into the manual editing section.
+
+
+    #### 4. Finalize & Generate
+    1.  Review the **Manual Input** section. Edit text, adjust hours, or remove unnecessary items.
+    2.  Click **`Generate final DOCX`**.
+    3.  Once processing is complete, a **Download** button will appear.
+    4.  Note the **Version ID**. You can use this ID later to regenerate the exact same document if the file is lost.
+
+    #### 5. Version Control
+    Need to recover a previous proposal?
+    * Scroll to the "Regenerate" section at the bottom.
+    * Enter the **Version ID** (provided upon successful generation).
+    * Click **Regenerate DOCX from DB**.
+    """, unsafe_allow_html=True)
 # --- Sidebar Configuration ---
 with st.sidebar:
     st.header("Backend / Settings")
@@ -234,7 +270,7 @@ col_left, col_right = st.columns([2, 1])
 
 with col_left:
     # NOTE: change labels and keys to match template/backend expected names
-    client_company_name = st.text_input("Client company name ", value="ООО Инновационные Решения", key="client_company_name")
+    client_company_name = st.text_input("Client company name ", value="Innovative Solutions LLC", key="client_company_name")
     provider_company_name = st.text_input("Provider company name", value="Digital Forge Group", key="provider_company_name")
     project_goal = st.text_input("Project goal (short)", value="Integrate CRM and migrate e-commerce platforms", key="project_goal")
     scope = st.text_area("Scope (detailed)", height=150, value="Migrate catalog, sync customers, create REST API for data sync.", key="scope")
@@ -244,7 +280,7 @@ with col_left:
 with col_right:
     st.subheader("Dates & Financials (USD)")
     deadline = st.date_input("Expected completion date", value=date.today(), key="deadline")
-    st.caption(f"Deadline must be at least {MIN_DEADLINE_DAYS} weeks from today.")
+    st.caption(f"Deadline must be at least {MIN_DEADLINE_DAYS} days from today.")
     development_cost = st.number_input("Development cost", min_value=0.0, value=45000.0, step=100.0, format="%.2f", key="development_cost")
     licenses_cost = st.number_input("Licenses cost", min_value=0.0, value=5000.0, step=50.0, format="%.2f", key="licenses_cost")
     support_cost = st.number_input("Support & maintenance", min_value=0.0, value=2500.0, step=50.0, format="%.2f", key="support_cost")
@@ -274,6 +310,9 @@ def build_payload(include_manual_deliverables=True, include_manual_phases=True):
         "technologies": [t.strip() for t in technologies.split(",") if t.strip()],
         "deadline": safe_date_to_iso(deadline),
         "tone": tone,
+        # --- ДОБАВИТЬ ЭТУ СТРОКУ ---
+        "team_size": int(team_size), 
+        # ---------------------------
         "proposal_date": safe_date_to_iso(date.today()),
         "valid_until_date": safe_date_to_iso(date.today()),
         "financials": {
@@ -288,16 +327,37 @@ def build_payload(include_manual_deliverables=True, include_manual_phases=True):
     else:
         payload["deliverables"] = []
     if include_manual_phases:
-        payload["phases"] = [
-            {
-                "phase_name": p.get("phase_name",""),
-                "duration_weeks": int(p.get("duration_weeks",4)),
-                "tasks": p.get("tasks","")
-            }
-            for p in st.session_state.get("phases_state", [])
-        ]
+        payload["phases"] = []
+        for p in st.session_state.get("phases_state", []):
+            # prefer explicit duration_hours if available, else fallback to duration_weeks
+            hours = None
+            if p.get("duration_hours") is not None:
+                try:
+                    hours = int(p.get("duration_hours"))
+                except Exception:
+                    hours = None
+            if hours is None and p.get("duration_weeks") is not None:
+                try:
+                    hours = int(p.get("duration_weeks")) * 40
+                except Exception:
+                    hours = None
+            if hours is None:
+                # final fallback: 40 hours (1 week)
+                hours = 40
+
+            # compute approximate weeks (integer)
+
+            weeks = max(1, int(math.ceil(hours / 40.0)))
+            payload["phases"].append({
+                "phase_name": p.get("phase_name", ""),
+                "duration_hours": int(hours),
+                "duration_weeks": int(weeks),
+                "tasks": p.get("tasks", "")
+            })
+
     else:
         payload["phases"] = []
+
 
     # return the constructed payload (important!)
     return payload
@@ -364,19 +424,57 @@ with edit_cols[1]:
     if deadline:
         days_remaining = (deadline - date.today()).days
         import math
-        # Считаем только рабочие дни (5/7)
-        work_days = max(0, math.floor(days_remaining * (5/7)))
-        
-        # ВАЖНО: Умножаем на размер команды!
+        from datetime import timedelta as _td
+
+        def count_workdays_ui(start: date, end: date) -> int:
+            if start >= end:
+                return 0
+            days = (end - start).days
+            full_weeks, extra_days = divmod(days, 7)
+            workdays = full_weeks * 5
+            for i in range(1, extra_days + 1):
+                if (start + timedelta(days=i)).weekday() < 5:
+                    workdays += 1
+            return workdays
+
+        work_days = count_workdays_ui(date.today(), deadline)
+
+        days_remaining = (deadline - date.today()).days
+
+
         capacity_per_person = work_days * 8
         total_team_capacity = capacity_per_person * team_size
-        
+
+        # Создаём payload (локальная preview-версия) перед добавлением reality_check
+        try:
+            payload = build_payload(include_manual_deliverables=False, include_manual_phases=True)
+        except Exception:
+            payload = {}
+
+        payload["reality_check"] = {
+            "planned_effort_hours": int(total_planned_hours),
+            "team_capacity_hours": int(total_team_capacity),
+            "delta_hours": int(total_team_capacity - total_planned_hours),
+            "allow_overflow": True,
+            "requested_deadline_extension_days": None
+        }
+
+
+
+
         st.markdown("#### ⏳ Time Reality Check")
         c1, c2, c3 = st.columns(3)
         c1.metric("Planned Effort", f"{total_planned_hours} h")
         c2.metric("Team Capacity", f"{total_team_capacity} h", help=f"{work_days} days * 8h * {team_size} people")
         c3.metric("Delta", f"{total_team_capacity - total_planned_hours} h", 
                   delta_color="normal" if total_team_capacity >= total_planned_hours else "inverse")
+        st.write("DEBUG: work_days", work_days)
+        st.write("DEBUG: team_size", team_size)
+        st.write("DEBUG: capacity_per_person", capacity_per_person)
+        st.write("DEBUG: total_team_capacity", total_team_capacity)
+        st.write("DEBUG: planned phases (list):", payload.get("phases", []))
+        st.write("DEBUG: total_planned_hours", total_planned_hours)
+
         
         if total_planned_hours > total_team_capacity:
             st.warning(
@@ -405,30 +503,69 @@ if btn_suggest:
                     data = r.json()
                     st.session_state["suggestions_data"] = data
                     
-                    meta = data.get("metadata", {})
-                    is_feasible = meta.get("deadline_feasible", True)
-                    risk_msg = meta.get("risk_message", "")
-                    total_est = meta.get("total_hours_realistic", 0)
-                    cap = meta.get("capacity_hours_available", 0)
+                    meta = data.get("metadata", {}) or {}
+                    # безопасное извлечение чисел с фолбэком
+                    def _to_int_safe(x, default=0):
+                        try:
+                            if x is None:
+                                return default
+                            return int(float(x))
+                        except Exception:
+                            return default
 
-                    # Логика отображения
-                    if is_feasible:
-                        # Если план вписался, но часов много, значит предполагается команда
-                        if cap > 0 and total_est > (cap * 1.2): # Если оценка больше емкости одного человека на 20%
-                             generation_status.info(
-                                f"**Plan Fits Deadline (with Team):**\n"
-                                f"Total Effort: {total_est}h. Available (1 dev): {cap}h.\n"
-                                f"**Suggestion:** This plan requires multiple developers working in parallel to meet the deadline."
-                             )
-                        else:
-                             generation_status.success(f"Plan fits comfortably within the deadline.")
+                    is_feasible = bool(meta.get("deadline_feasible", True))
+                    risk_msg = str(meta.get("risk_message", "") or "")
+                    total_est = _to_int_safe(meta.get("total_hours_realistic"), 0)
+                    cap = meta.get("capacity_hours_available", None)
+
+                    # Превращаем cap в int только если это число; оставляем None если не указано
+                    if cap is None:
+                        cap_int = None
                     else:
-                        # Если даже с оптимизацией не влезли
+                        cap_int = _to_int_safe(cap, None)
+
+                    # Логика отображения — защитные проверки на None
+                    if is_feasible:
+                        try:
+                            cap_raw = meta.get("capacity_hours_available", None)
+                            # Normalise cap to int or None
+                            cap = None
+                            if cap_raw is not None and cap_raw != "":
+                                try:
+                                    cap = int(float(cap_raw))
+                                except Exception:
+                                    cap = None
+
+                            total_est = meta.get("total_hours_realistic", 0) or 0
+                            try:
+                                total_est = int(float(total_est))
+                            except Exception:
+                                total_est = 0
+
+                            if cap is not None and cap > 0 and total_est > (cap * 1.2):
+                                generation_status.info(
+                                    f"**Plan Fits Deadline (with Team):**\n"
+                                    f"Total Effort: {total_est}h. Available (1 dev): {cap}h.\n"
+                                    f"**Suggestion:** This plan requires multiple developers working in parallel to meet the deadline."
+                                )
+                            else:
+                                if cap is None:
+                                    generation_status.info("Plan feasibility: capacity unknown (deadline parsing failed or not provided).")
+                                elif total_est <= cap:
+                                    generation_status.success("Plan fits comfortably within the deadline.")
+                                else:
+                                    generation_status.warning("Plan may not fit the specified capacity — review metadata for details.")
+                        except Exception as e:
+                            logger.exception("Post-suggest logic error: %s", e)
+                            generation_status.info("Received suggestion metadata; unable to interpret capacity checks (see logs).")
+                    else:
+                        cap_display = cap_int if cap_int is not None else "Unknown"
                         generation_status.error(
                             f"🚨 **Deadline Risk:** {risk_msg}\n\n"
-                            f"Minimal Realistic Estimate: **{total_est}h** vs Available: **{cap}h**.\n"
+                            f"Minimal Realistic Estimate: **{total_est}h** vs Available: **{cap_display}h**.\n"
                             "The generated proposal will include this as a Critical Risk."
                         )
+
                     
                     st.rerun()
                 else:
@@ -569,11 +706,47 @@ if btn_regenerate:
             except Exception as e:
                 regen_status.error(f"Regenerate failed: {e}")
 
+# --- Footer: Professional User Guide ---
 st.markdown("---")
-st.markdown("## Notes")
-st.markdown("""
-- **Backend requirement:** Ensure your FastAPI backend is running at the configured URL (`http://localhost:8000` by default).
-- **Key mapping:** This UI sends `client_company_name` and `provider_company_name` to match the DOCX template placeholders.
-- **Deliverables / Phases:** Deliverables are sent as `{"title","description","acceptance_criteria"}` and phases as `{"phase_name","duration_weeks","tasks"}`.
-- **Suggestions:** Use "Get LLM suggestions" to receive suggested deliverables/phases; add selected suggestions into manual lists before generating.
-""")
+with st.expander("📖 **User Guide: How to create a winning proposal**", expanded=False):
+    st.markdown("""
+    ### Welcome to the AI Sales Proposal Generator
+    This tool streamlines the creation of commercial proposals (SOWs) by combining structured data input with Large Language Model (LLM) reasoning. Follow this workflow to generate high-quality documents.
+
+    #### 1. Configuration (Sidebar)
+    * **API Connection:** Ensure the Backend URL is correct (default: `http://localhost:8000`).
+    * **Timeout:** Increase this value if you are generating complex proposals with slow LLM models.
+
+    #### 2. Project Initialization
+    * **Core Details:** Enter the Client and Provider names exactly as they should appear in the contract.
+    * **Scope & Goal:** Be specific. The AI uses the "Scope" field as the primary source of truth for generating deliverables.
+    * **Tone:** Select the voice of the document (e.g., *Formal* for enterprise, *Marketing* for agencies).
+    * **Financials & Team:** Set your budget and team size. This data calculates the ROI and project feasibility.
+
+    #### 3. AI-Assisted Planning (Recommended)
+    Instead of writing everything from scratch, let the AI do the heavy lifting:
+    1.  Click **`Get LLM suggestions`**.
+    2.  Wait for the AI to analyze your Scope and Deadline.
+    3.  Review the **Suggested Deliverables** and **Phases** that appear below.
+    4.  Check the boxes next to the items you like and click **`➕ Add Selected...`**. This moves them into the manual editing section.
+
+    #### 4. The "Reality Check" Protocol ⏳
+    Pay attention to the **Time Reality Check** widget in the Phases section.
+    * **Planned Effort:** The total hours calculated from your phases.
+    * **Team Capacity:** The theoretical maximum hours your team can work before the deadline (considering weekends and team size).
+    * **Delta:**
+        * <span style="color:green">**Green:**</span> Your plan is feasible.
+        * <span style="color:red">**Red:**</span> You are overloaded. Consider increasing **Team Size** or moving the **Deadline**.
+
+    #### 5. Finalize & Generate
+    1.  Review the **Manual Input** section. Edit text, adjust hours, or remove unnecessary items.
+    2.  Click **`Generate final DOCX`**.
+    3.  Once processing is complete, a **Download** button will appear.
+    4.  Note the **Version ID**. You can use this ID later to regenerate the exact same document if the file is lost.
+
+    #### 6. Version Control
+    Need to recover a previous proposal?
+    * Scroll to the "Regenerate" section at the bottom.
+    * Enter the **Version ID** (provided upon successful generation).
+    * Click **Regenerate DOCX from DB**.
+    """, unsafe_allow_html=True)

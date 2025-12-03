@@ -392,5 +392,6 @@ async def process_ai_content(proposal: Dict[str, Any], tone: str = "Formal") -> 
         "connections": viz.get("connections") if isinstance(viz.get("connections"), list) else [],
         "milestones": viz.get("milestones") if isinstance(viz.get("milestones"), list) else []
     }
+    
     # Also include textual keys to be used by doc_engine
     return out, used_model

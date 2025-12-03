@@ -14,7 +14,7 @@ from urllib.parse import quote
 import asyncio
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from backend.app.services import visualization_service as vis
-
+from backend.app.services.request_storage import save_client_request
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -272,7 +272,19 @@ def _prepare_list_data(context: Dict[str, Any]) -> None:
             if not isinstance(p, dict):
                 continue
             pp = dict(p)
-            # normalize weeks/duration
+            
+            # --- ИСПРАВЛЕНИЕ НАЧАЛО: Сохраняем часы и недели ---
+            raw_hours = pp.get("duration_hours")
+            raw_weeks = pp.get("duration_weeks")
+            
+            # Если часов нет, но есть недели - конвертируем
+            if raw_hours is None and raw_weeks is not None:
+                try:
+                    raw_hours = int(float(raw_weeks) * 40)
+                except:
+                    pass
+            
+            # Формируем отображаемую строку duration (для легаси шаблонов)
             if "duration_weeks" in pp and "duration" not in pp:
                 pp["duration"] = pp.get("duration_weeks")
             elif "duration" in pp and "duration_weeks" not in pp:
@@ -280,6 +292,8 @@ def _prepare_list_data(context: Dict[str, Any]) -> None:
                     pp["duration"] = int(str(pp["duration"]).split()[0])
                 except Exception:
                     pp["duration"] = 1
+            # --- ИСПРАВЛЕНИЕ КОНЕЦ ---
+
             # generate phase_name with index if not provided
             raw_name = pp.get("phase_name") or pp.get("name") or ""
             if not raw_name or raw_name.strip().lower() in ("phase", "этап"):
@@ -287,15 +301,21 @@ def _prepare_list_data(context: Dict[str, Any]) -> None:
             else:
                 phase_name = raw_name
             tasks = pp.get("tasks") or ""
+            
             # ensure strings
             phases_out.append({
                 "phase_name": phase_name,
                 "duration": str(pp.get("duration") or ""),
-                "tasks": str(tasks)
+                # ВАЖНО: Явно передаем duration_hours, чтобы doc_engine их увидел
+                "duration_hours": raw_hours, 
+                "duration_weeks": raw_weeks,
+                "tasks": str(tasks),
+                # Также полезно передать owner/priority если они есть
+                "owner": pp.get("owner", ""),
+                "priority": pp.get("priority", "")
             })
         context.pop("phases", None)
         context["phases_list"] = phases_out
-
 
 def _normalize_incoming_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
     p = dict(raw) if isinstance(raw, dict) else {}
@@ -567,7 +587,7 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
         logger.exception("AI generation failed: %s", e)
         # Return explicit error detail as expected by tests
         raise HTTPException(status_code=500, detail=f"AI generation failed: Exception: {str(e)}")
-
+    
     # 4. Build base context for doc_engine
     context = _proposal_to_dict(proposal)
     # Ensure both naming variants exist
@@ -653,10 +673,33 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
     else:
         context["deliverables_list"] = suggested_deliverables or []
 
-    if context.get("phases") and isinstance(context.get("phases"), list) and len(context.get("phases"))>0:
-        context["phases_list"] = context.get("phases")
+    if payload.get("deliverables") and len(payload["deliverables"]) > 0:
+        context["deliverables_list"] = payload["deliverables"]
     else:
-        context["phases_list"] = suggested_phases or []
+        context["deliverables_list"] = ai_sections.get("suggested_deliverables", [])
+
+
+    # ... (код выше) ...
+
+    # 2. Приоритет Phases (ЖЕСТКИЙ)
+    if payload.get("phases") and len(payload["phases"]) > 0:
+        # Если пользователь прислал фазы, используем ТОЛЬКО их
+        context["phases_list"] = payload["phases"]
+        
+        # --- ИСПРАВЛЕНИЕ (Начало) ---
+        # Проверяем, существует ли ключ 'visualization', и создаем его, если нет
+        if "visualization" not in context:
+            context["visualization"] = {}
+            
+        # Теперь безопасно записываем milestones
+        context["visualization"]["milestones"] = payload["phases"]
+        # --- ИСПРАВЛЕНИЕ (Конец) ---
+        
+    else:
+        # Только если пусто, берем от AI
+        context["phases_list"] = ai_sections.get("suggested_phases", [])
+
+    # ... (код ниже) ...
 
     # 7. Visualization: normalize ai_sections["visualization"] into context for doc_engine
     viz = {}
@@ -767,7 +810,11 @@ async def generate_proposal(payload: Dict[str, Any] = Body(...)):
     except Exception as e:
         logger.error("Error saving proposal version: %s", e)
         version_id = None
-
+    request_path = save_client_request(
+        payload=payload_dict,
+        version_id=version_id,
+        proposal_id=proposal_id  # если есть
+    )
     # 14. Build filename and headers, return StreamingResponse
     filename = f"{_safe_filename(context.get('client_company_name') or '')}_{_safe_filename(context.get('project_goal') or '')}.docx"
     encoded = quote(filename)

@@ -6,7 +6,9 @@ import logging
 from backend.app.services.visualization_service import (
     generate_gantt_image,
     generate_lifecycle_diagram,
+    generate_uml_diagram,
 )
+
 
 logger = logging.getLogger("uvicorn.error")
 router = APIRouter(prefix="/api/v1/visualization", tags=["Visualization"])
@@ -42,6 +44,30 @@ async def gantt_png(data: Dict[str, Any], agent_mode: Optional[bool] = Query(Fal
         logger.exception("Gantt PNG generation failed")
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.post("/uml")
+async def uml(data: Dict[str, Any], width: Optional[int] = Query(1400, description="Image width in px"), agent_mode: Optional[bool] = Query(True, description="If true, use agent enrichment for UML")):
+    """
+    Generate UML diagram describing the CLIENT project and return JSON summary (size).
+    """
+    try:
+        image_bytes = generate_uml_diagram(data, width=width, agent_mode=bool(agent_mode))
+        return {"status": "ok", "size": len(image_bytes)}
+    except Exception as e:
+        logger.exception("UML generation failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/uml/png")
+async def uml_png(data: Dict[str, Any], width: Optional[int] = Query(1400), agent_mode: Optional[bool] = Query(True)):
+    """
+    Generate UML diagram and return raw PNG (Content-Type: image/png).
+    """
+    try:
+        image_bytes = generate_uml_diagram(data, width=width, agent_mode=bool(agent_mode))
+        return Response(content=image_bytes, media_type="image/png")
+    except Exception as e:
+        logger.exception("UML PNG generation failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/lifecycle")
 async def lifecycle(data: Dict[str, Any], width: Optional[int] = Query(1400, description="Image width in px"), height: Optional[int] = Query(None, description="Image height in px")):

@@ -19,9 +19,11 @@ import hashlib
 import re
 from typing import Dict, Any, Tuple, Optional, List
 from datetime import date, datetime, timedelta
+import math
+from datetime import timedelta as _td
 
 from functools import lru_cache, wraps
-import requests
+import requests # Для сетевых ошибок в requests (хотя здесь используется client, все равно полезно)
 
 # try import openai
 try:
@@ -35,6 +37,7 @@ except Exception:
 # try import gemini
 try:
     import google.generativeai as genai
+    # Импортируем специфические ошибки Gemini
     from google.api_core.exceptions import GoogleAPIError as GeminiAPIError, ResourceExhausted as GeminiRateLimitError
 except Exception:
     genai = None
@@ -44,6 +47,7 @@ logger = logging.getLogger("uvicorn.error")
 
 # --- ENV / configuration ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# FIX 1: Используем JSON-совместимую модель по умолчанию
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo-0125") 
 OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_FALLBACK_MODEL", OPENAI_MODEL)
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "1000"))
@@ -69,267 +73,485 @@ if openai is not None and OPENAI_API_KEY:
 # --- utilities ---
 def _prompt_hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+import json
+import math
+import logging
+from datetime import date, datetime
+from string import Template
+from typing import Any, Dict
+
+logger = logging.getLogger(__name__)
+
 
 def _build_prompt(proposal: Dict[str, Any], tone: str = "Formal") -> str:
     """
-    Строит промпт для генерации полного документа. 
-    Включает логику учета Team Size и сокращения Scope.
+    Rewritten build_prompt: strong, defensive, structured, and agent-friendly.
+    - Requires the model to return a single JSON object (strict schema) only.
+    - Forces structured output: team_structure (roles+skills), phases (preferred_role, required_skills, effort_hours), visualization, metadata.
+    - Contains strict adaptation algorithm, risk rules, API rate-limit verification steps, and audience-aware presentation rules.
+    - Uses Template.safe_substitute for safe insertion of computed values.
+    - NEVER raises: always returns a non-empty prompt string (fallback minimal prompt on failure).
     """
-    client = proposal.get("client_company_name") or proposal.get("client_name") or ""
-    provider = proposal.get("provider_company_name") or proposal.get("provider_name") or ""
-    project_goal = proposal.get("project_goal", "")
-    scope = proposal.get("scope", "")
-    technologies = proposal.get("technologies") or []
-    techs = ", ".join(technologies) if isinstance(technologies, (list, tuple)) else str(technologies)
-    deadline = proposal.get("deadline", "")
-    manual_deliverables = proposal.get("deliverables", [])
-    manual_phases = proposal.get("phases", [])
-    deliverables_input_str = json.dumps(manual_deliverables, indent=2, ensure_ascii=False) if manual_deliverables else "[]"
-    phases_input_str = json.dumps(manual_phases, indent=2, ensure_ascii=False) if manual_phases else "[]"
-    
-    team_size = proposal.get("team_size", 1)
-
-    backend_tech = "Python (FastAPI)"
-    frontend_tech = "Не указан (API-only)"
-
-    # --- compute available time in hours ---
-    time_available_hours = "N/A"
-    total_team_capacity_hours = "Unknown"
-    
+    import json
+    import math
+    from datetime import date, datetime
+    from string import Template
+    from textwrap import dedent
+    import logging
     try:
-        deadline_raw = proposal.get("deadline", "")
-        if deadline_raw:
-            if isinstance(deadline_raw, date):
-                deadline_str = deadline_raw.strftime("%Y-%m-%d")
-            else:
-                deadline_str = str(deadline_raw)
-            deadline_date = datetime.strptime(deadline_str, "%Y-%m-%d").date()
-            today = date.today()
-            if deadline_date > today:
-                time_delta = deadline_date - today
-                # Расчет рабочих дней (5/7)
-                import math
-                work_days = max(0, math.floor(time_delta.days * (5/7)))
-                available_hours_single = work_days * 8
-                
-                # Общая емкость команды
-                total_capacity = available_hours_single * team_size
-                
-                if total_capacity < 8:
-                    total_capacity = 8
-                
-                time_available_hours = f"{total_capacity} hours (Team Size: {team_size})"
-                total_team_capacity_hours = str(total_capacity)
-            else:
-                time_available_hours = "0 hours (deadline passed)"
-                total_team_capacity_hours = "0"
+        logger = logging.getLogger(__name__)
     except Exception:
-        pass
-
-    # adjust tech hints
-    if isinstance(technologies, list) and technologies:
-        py_techs = [t for t in technologies if isinstance(t, str) and t.lower() in ('python', 'fastapi', 'django')]
-        js_techs = [t for t in technologies if isinstance(t, str) and t.lower() in ('react', 'vue', 'angular', 'frontend')]
-        if py_techs:
-            backend_tech = ", ".join(py_techs)
-        elif not js_techs:
-            backend_tech = "Node.js (Express/NestJS)"
-        if js_techs:
-            frontend_tech = ", ".join(js_techs)
-        elif not py_techs and not js_techs:
-            backend_tech = f"Указано: {techs}"
-            frontend_tech = "Не указан"
+        class _FakeLogger:
+            def exception(self, *a, **k): pass
+            def warning(self, *a, **k): pass
+            def info(self, *a, **k): pass
+        logger = _FakeLogger()
+    # --- helpers ---
+    def safe_get(d, *keys, default=None):
+        try:
+            for k in keys:
+                if isinstance(d, dict) and k in d:
+                    v = d[k]
+                    if v is not None:
+                        return v
+        except Exception:
+            pass
+        return default
+    def as_safe_str(v, default=""):
+        try:
+            if v is None:
+                return default
+            if isinstance(v, (date, datetime)):
+                return v.strftime("%Y-%m-%d")
+            if isinstance(v, (list, dict, tuple)):
+                return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+            s = str(v)
+            s = s.replace("\r", " ").replace("\n", " ").strip()
+            return " ".join(s.split())
+        except Exception:
+            return default
+    def as_safe_json_str(v, default="[]"):
+        try:
+            if v is None:
+                return default
+            if isinstance(v, str) and not v.strip():
+                return default
+            j = json.dumps(v, indent=2, ensure_ascii=False)
+            return j.replace("\n", "\\n")
+        except Exception:
+            try:
+                return json.dumps(default)
+            except Exception:
+                return default
+    def safe_int(v, default=None):
+        try:
+            if v is None:
+                return default
+            if isinstance(v, bool):
+                return int(v)
+            if isinstance(v, (int,)):
+                return int(v)
+            if isinstance(v, float):
+                return int(math.ceil(v))
+            s = str(v).strip()
+            if s == "":
+                return default
+            if "." in s:
+                return int(math.ceil(float(s)))
+            return int(s)
+        except Exception:
+            return default
+    # --- extract core fields with fallbacks ---
+    client = as_safe_str(safe_get(proposal, "client_company_name", "client_name"), "the Client")
+    provider = as_safe_str(safe_get(proposal, "provider_company_name", "provider_name"), "the Provider")
+    project_goal = as_safe_str(safe_get(proposal, "project_goal", "goal", default=""))
+    scope = as_safe_str(safe_get(proposal, "scope", "description", default=""))
+    technologies_field = safe_get(proposal, "technologies", "tech", default=[])
+    if isinstance(technologies_field, (list, tuple)):
+        techs = ", ".join(as_safe_str(x) for x in technologies_field)
+    else:
+        techs = as_safe_str(technologies_field, "")
+    # audience: executive|technical_lead|mixed
+    audience = as_safe_str(safe_get(proposal, "audience"), "mixed")
+    if audience not in ("executive", "technical_lead", "mixed"):
+        audience = "mixed"
+    # deliverables & phases provided
+    user_deliverables = safe_get(proposal, "deliverables", "suggested_deliverables", default=[])
+    user_phases = safe_get(proposal, "phases", "suggested_phases", default=[])
+    deliverables_input_str = as_safe_json_str(user_deliverables, default="[]")
+    phases_input_str = as_safe_json_str(user_phases, default="[]")
+    team_size = safe_int(proposal.get("team_size"), default=1)
     
-    prompt = f"""
-You are the "Expert Committee" from the company "{provider}", preparing a Commercial Proposal (CP) for "{client}".
-You must INTERNALLY perform role-based reasoning,
-and then output a SINGLE JSON that exactly matches the REQUESTED KEYS.
-
-### PROJECT INPUT DATA:
-* **Client:** "{client}"
-* **Contractor:** "{provider}"
-* **Project Goal:** "{project_goal}"
-* **Description (Scope):** "{scope}"
-* **Technologies (Input):** "{techs}"
-* **Deadline:** "{deadline}"
-* **Team Size:** {team_size} people
-* **TOTAL TEAM CAPACITY (CRITICAL LIMIT):** {total_team_capacity_hours} hours
-* **Tone:** "{tone}"
-
----
-
-### USER-PROVIDED DATA (Source of Truth):
-* **Provided Deliverables:** {deliverables_input_str}
-* **Provided Phases:** {phases_input_str}
-
----
-
-### OVERALL GUIDELINES (do not change input names or schema)
-1. ALL generated narrative text MUST be **project-specific**. ...
-2. ALL lists of items (deliverables, phases, components, milestones) MUST include, where applicable: **owner**, **purpose**, **acceptance criteria**, and **reasonable effort estimate** (`duration_hours` as integer).
-3. Keep and enforce the original JSON output schema and keys exactly. Use `\\n` in JSON strings for newlines. Highlight key concepts and technologies in **bold Markdown** inside all text fields.
-4. Be conservative: when making inferences (durations, owners, tasks) prefer minimal safe assumptions and state them in `assumptions_text`.
-5. Format: use Markdown headings for sections, and `\\n` (escaped newline) inside JSON text fields. Use `**Role:**` and a newline for each role entry under `team_structure_text`.
-6. **NO SIGN-OFFS:** Do NOT end sections with "Sincerely,", "Prepared by", or the company name. Output ONLY the content of the section.
-7. **Capacity Rule:** You have {team_size} developers and {total_team_capacity_hours} hours total. You MUST respect this limit.
----
-
-### STEP 1: INTERNAL REASONING (Internal Reasoning - DO NOT SHOW IN JSON)
-Perform role-specific internal reasoning. For each role, include a short internal planning checklist (these are internal notes and should NOT be placed directly into final free-text fields except where the schema demands fields derived from them).
-
-1. **Agent "Solution Architect":**
-    * **Estimation:** Estimate the total effort required for the full scope.
-    * **Capacity Check:** Compare Estimated Effort vs {total_team_capacity_hours} hours.
-    * **STRATEGY (CRITICAL):** - IF Estimated Effort > {total_team_capacity_hours}: 
-        You MUST **DROP** non-essential phases (e.g., "Nice-to-have UI", "Advanced Analytics") or **COMPRESS** time (e.g., "Lean QA").
-      - You must NOT propose a schedule that exceeds the capacity significantly.
-    * Primary objective: produce a **technical design** explicitly mapped to the provided `scope` (e.g., CRM↔Shopify integration), the `technologies` input, and the **{time_available_hours}** constraint.
-    * **Architecture priority:** choose the simplest architecture that meets project goals within the available time: favor managed services, tested libraries, and standard integration patterns (webhooks, retry queues, idempotent APIs).
-    * **Deliverables from this agent (exact fields to produce):**
-        - `technical_backend_text`: Must include **Solution Architecture**, **Backend Stack ({backend_tech})**, **Database**, **API Contracts** (list of endpoints with purpose & brief payload summary), and **Error/Retry Strategy**. Each subsection must use a Markdown heading and `\\n`.
-        - `technical_frontend_text`: If frontend is out-of-scope, state **explicitly** "API-only" and include "future UI considerations" with concrete suggestions (e.g., "admin dashboard to monitor sync status: endpoints required, sample views").
-        - `technical_deployment_text`: Must include **CI/CD (DevOps)**, **Environments**, **Monitoring & Observability** (metrics, logs, alerting), and **Backup/Recovery** notes.
-    * For every technical claim, if it depends on an assumption (e.g., API rate limits are acceptable), list that assumption in `assumptions_text`.
-    * Provide a compact list `visualization.components` — each component must include `id`, `title`, `description` (single sentence tied to the project), `type`, and `depends_on`.
-
-2. **Agent "Project Manager (PM)":**
-    * **Audit the PM's Strategy:**
-      - IF the PM dropped a phase, create a risk: `* **Scope Reduction:** To meet the deadline, [Phase Name] was excluded. **Impact:** [Consequence].`
-      - IF the PM compressed time, create a risk: `* **Quality Risk:** [Phase] duration compressed. **Impact:** Higher risk of bugs.`
-      - IF Team Size > 1, create a risk: `* **Resourcing:** Requires {team_size} FTEs working in parallel.`
-    * **Analysis:** Compare the Ideal Scope Effort vs **{time_available_hours}**.
-    * **Strategy:** - If Ideal Effort > Available Time: You MUST **drop non-critical phases** (e.g., "Advanced Reporting", "Nice-to-have UI") OR **compress durations** (e.g., reduce QA time, remove Load Testing).
-        - **CRITICAL:** Remember exactly what you dropped or compressed. This is a trade-off.
-    * **Deliverables (CRITICAL):**
-        - If `Provided Deliverables` is NOT empty: use the provided list as `suggested_deliverables` but **augment** each entry with `description`, `acceptance` (specific acceptance tests or criteria) and a likely `owner` and `effort_estimate_hours` if missing. 
-        - If `Provided Deliverables` is empty: generate `suggested_deliverables` from `scope`.
-    * **Phases (CRITICAL):**
-        - If `Provided Phases` is NOT empty: use them as `suggested_phases` and `visualization.milestones`. If they miss `duration_hours` or `key_tasks`, infer them conservatively.
-        - If `Provided Phases` is empty: generate `suggested_phases` where the sum of `duration_hours` **MUST NOT exceed** the available whole hours in **{time_available_hours}** (assuming 1 FTE), unless impossible...
-        - Each phase object must include `name`, `description`, `duration_hours` (integer), and `key_tasks`.
-    * **Team:** For each required role produce an item in `team_structure_text` using `**Role:**\\n` followed by 3–6 concrete bullets.
-
-3. **Agent "QA Lead":**
-    * Given **{time_available_hours}**, propose a **lean, automation-first** QA strategy: unit tests, contract/API tests, CI gate, and a compressed UAT plan.
-    * Provide `qa_strategy_text` including **Test Coverage Targets**, **Automation Scope**, **Testing Tools**, and **UAT approach** (how client will perform and sign-off).
-    * Provide `qa_testing_types_text`: use Markdown headings and ensure each testing type is accompanied by a one-sentence project-specific example (e.g., **API Testing:** Verify webhook retry and idempotency for order updates between Shopify and CRM).
-    * If scope was reduced, mention "MVP Approach" in `executive_summary_text`.
-    * Ensure `phases_summary_text` explains the logic of the chosen schedule.
-4. **Agent "Risk Manager":**
-    * **Analyze the PM's Strategy:** Look at the `suggested_phases`. Did the PM have to cut corners to meet the deadline?
-    * **MANDATORY RISK REPORTING:**
-      - If any standard phase was **dropped** (e.g., "Load Testing skipped"), you MUST add a risk: `* **Scope Reduction:** To meet the deadline, [Phase Name] was excluded. **Impact:** [Consequence].`
-      - If any phase was **compressed** (e.g., "QA reduced by 50%"), you MUST add a risk: `* **Quality Risk:** QA duration is compressed. **Impact:** Higher risk of post-launch bugs.`
-      - If the schedule requires **Team Scaling** (more than 1 dev), add a risk: `* **Resourcing Risk:** Timeline requires parallel execution (Team Size > 1).`
-    * Format these findings into `risks_text` using Markdown bullets.
-    * Identify and list **project-specific** risks and tie each risk to a **mitigation** and an **owner** (who will take responsibility for mitigation).
-    * IMPORTANT: If the **USER-PROVIDED DATA** (the `Provided Phases` or `metadata`) contains a non-empty `dropped_phases` list (or any phases marked removed/priority:"optional"), you MUST add a risk entry for each dropped phase using the pattern:
-      `* **Scope Reduction:** [Dropped Phase Name]. **Impact:** <short consequence>. **Mitigation:** <plan>. **Owner:** <role>.`
-        * IMPORTANT: Check `USER-PROVIDED DATA` and `metadata` for overflow/dropped info:
-      - If `metadata.dropped_phases` is non-empty, for each name add a risk entry:
-        `* **Scope Reduction:** [Dropped Phase Name]. **Impact:** <short consequence>. **Mitigation:** <plan>. **Owner:** <role>.`
-      - If `metadata.allow_overflow_used` is true or `metadata.overflow_hours` > 0, add a risk entry:
-        `* **Schedule Overflow:** Plan exceeds available capacity by X hours. **Impact:** Requires additional contractor time or extended deadline. **Mitigation:** Request client approval for +X hours or reduce scope. **Owner:** Project Manager.`
-      - If `deadline_feasible` is false, include a critical risk line clearly stating the hour mismatch and recommended actions.
-
-    * Produce `assumptions_text` and `risks_text`. Each bullet MUST be on a new line and risks should use the pattern `* **Risk:** Description. **Mitigation:** ... **Owner:** ...`.
-
-    * Produce `assumptions_text`.
-
-5. **Agent "Technical Writer":**
-    * Aggregate all agent outputs and produce final copy that is consistent across sections.
-    * Ensure **every** text block in the final JSON is:
-        - Project-specific,
-        - Uses Markdown headings where required,
-        - Highlights key terms in **bold**,
-        - Uses `\\n` for newlines,
-        - Consistent with `suggested_phases` and `suggested_deliverables`.
-    * When the schema requests 2–3 paragraphs, produce exactly that amount of paragraphs (no more, no less).
-    * `executive_summary_text`: If risks are high (phases dropped), mention that the proposal focuses on an **MVP** approach.
-    * Make `executive_summary_text` and `project_mission_text` clearly map to the client's business outcomes and the deliverables (e.g., reduced manual data entry, real-time customer sync).
-
----
-
-### STEP 2: FINAL JSON (Final JSON Output)
-(RETURN ONLY THIS JSON OBJECT. Ensure JSON strings containing formatting use `\\n` for a newline.
-**CRITICAL:** For readability, highlight key terms in **bold Markdown** within all text fields.)
-
-{{
-    // --- Sections 1-5 (General) ---
-    "executive_summary_text": "(Detailed text from Technical Writer. 3-4 paragraphs. Must be consistent with the phases/deliverables. If scope was reduced, mention this is an MVP delivery)",
-    "project_mission_text": "(Detailed text from Technical Writer. 3-4 paragraphs)",
-
-    // --- Section 6 (Assumptions and Risks) ---
-    "assumptions_text": " (Text from Risk Manager. Each point MUST be on a new line with `\\n`. \\n* Assumption 1...\\n* Assumption 2...)",
-    "risks_text": "(Text from Risk Manager. MUST include Scope Reductions/Compressions if applicable. \\n* **Risk 1:** ... \\n* **Scope Trade-off:** To meet the {deadline} deadline, we excluded [Feature X]. **Impact:** ...)",(CRITICAL: Must include Scope Reductions/Compressions. \\n* **Risk 1:** ... \\n* **Scope Trade-off:** To meet the deadline, we excluded...)",
-    // --- Section 7 (Technical Solution) ---
-    "technical_backend_text": " (Text from Solution Architect. MUST include Markdown headings and `\\n`. \\n**Solution Architecture:**\\nDescription including API contracts and error strategy...\\n**Backend Stack ({backend_tech}):**\\nDescription...\\n**Database (PostgreSQL/MongoDB):**\\nDescription...\\n**API Contracts:**\\n- POST /sync/products -> purpose, brief payload, acceptance...)",
-    "technical_frontend_text": " (Text from Solution Architect. MUST include Markdown headings and `\\n`. \\n**UI Approach ({frontend_tech}):**\\nDescription including "API-only" or minimal admin UI requirements...\\n**Responsiveness and Accessibility:**\\nDescription (if applicable)...)",
-    "technical_deployment_text": "(Text from Solution Architect. MUST include Markdown headings and `\\n`. \\n**CI/CD (DevOps):**\\nDescription including pipeline gates and automated test steps...\\n**Environments:**\\nDescription (Dev, Staging, Prod) and monitoring...)",
-    "engagement_model_text": "(Text from PM. 2-3 paragraphs. Justification for Fixed Price or T&M)",
-
-    // --- Section 8 (Project Execution) ---
-    "delivery_approach_text": " (Text from PM. MUST include Markdown headings and `\\n`. \\n**Methodology (Agile/Scrum):**\\nDescription...\\n**Change Management:**\\nDescription...)",
-    "team_structure_text": "(Text from PM. MUST include `**Role:**` and `\\n` for EVERY role. Each role MUST list 3-6 concrete tasks tied to the PROJECT. Example: \\n**Lead Backend Engineer:**\\nImplement FastAPI endpoints for product import; Design audit log schema; Ensure idempotent sync flows; Write unit tests for mapping logic.)",
-    "status_reporting_text": " (Text from PM. MUST include Markdown headings and `\\n`. \\n**Communications and Meetings:**\\nDescription (Daily standups, Sprint Demos, UAT windows)...\\n**Tools:**\\nDescription (Jira, Slack, Confluence)...)",
-    
-    // --- NEW KEY (Section 8b) ---
-    "phases_summary_text": "(Text from PM/Writer. 3-4 paragraphs. A narrative summary of the phases and deliverables. MUST NOT just repeat the lists. Must explain the flow and connection between stages. The **phases_summary_text** MUST NOT simply repeat the list or diagram data. It must be a 3-4 paragraph narrative.)",
-
-    // --- Section 9 (Quality Assurance) ---
-    "qa_strategy_text": " (Text from QA Lead. MUST include Markdown headings and `\\n`. \\n**Overall QA Strategy:**\\nDescription...\\n**Test Documentation (TestRail):**\\nDescription...\\n**Tools:**\\nDescription...)",
-    "qa_testing_types_text": " (Text from QA Lead. MUST include Markdown headings and `\\n`. \\n**Types of QA Testing:**\\nDescription...\\n**Functional Testing:**\\nProject-specific examples...\\n**Non-Functional Testing:**\\nPerformance and reliability tests descriptions...\\n**Regression Testing:**\\nDescription...\\n**Integration Testing:**\\nDescription...\\n**User Acceptance Testing (UAT):**\\nDescription with acceptance criteria...)",
-
-    // --- Section 10 (Finance - Notes) ---
-    "financial_justification_text": "(2-3 paragraphs from Technical Writer about ROI, specifically referencing time savings and error reduction from automation.)",
-    "payment_terms_text": "(2-3 paragraphs from Technical Writer about payment conditions)",
-    "development_note": "(2-3 sentences)",
-    "licenses_note": "(1-2 sentences)",
-    "support_note": "(1-2 sentences)",
-
-    // --- Lists for Tables (Deliverables & Phases) ---
-    "suggested_deliverables": [
-        // (List of Deliverables from PM. Detailed.)
-        {{"title": "Project Knowledge Base (Confluence)", "description": "Complete project knowledge base, including specifications, User Stories, and diagrams.", "acceptance": "Documentation is current and approved"}},
-        {{"title": "Source Code (GitLab/GitHub)", "description": "Full access to source code with CI/CD pipelines.", "acceptance": "Code has passed review and meets standards"}},
-        {{"title": "Deployed Staging & Production Environments", "description": "Configured and operational environments for testing and production.", "acceptance": "Environments are deployed and stable"}}
+    if team_size >= 4:
+        team_composition_hint = f"REQUIRED: The team size is {team_size}. You MUST define exactly {team_size} distinct roles (e.g., Project Manager, Solution Architect, Senior Backend Dev, Frontend Dev, QA Engineer, DevOps). Do NOT suggest a single-person team."
+    elif team_size > 1:
+        team_composition_hint = f"REQUIRED: The team size is {team_size}. Define distinct roles for these {team_size} people."
+    else:
+        team_composition_hint = "The team size is 1 (Single Project Lead mode)."
+    # reality check extraction (if helper exists use it)
+    rc = {}
+    try:
+        extract_fn = globals().get("_extract_reality_check", None)
+        if callable(extract_fn):
+            rc = extract_fn(proposal) or {}
+    except Exception:
+        rc = {}
+    if not rc:
+        raw_rc = safe_get(proposal, "reality_check", default={})
+        if isinstance(raw_rc, dict):
+            rc = raw_rc
+    rc_planned = safe_int(rc.get("planned_effort_hours") or rc.get("planned_hours"), default=None)
+    rc_capacity = safe_int(rc.get("team_capacity_hours") or rc.get("capacity_hours"), default=None)
+    rc_allow_overflow = bool(rc.get("allow_overflow")) if rc.get("allow_overflow") is not None else False
+    rc_requested_extension = safe_int(rc.get("requested_deadline_extension_days"), default=None)
+    # team size: MUST use explicit if present; else fallback to 1
+    team_size = safe_int(safe_get(proposal, "team_size"), default=1)
+    if team_size is None or team_size <= 0:
+        team_size = 1
+    # compute capacity fallback from deadline if rc_capacity not provided
+    computed_capacity = None
+    try:
+        if rc_capacity is not None:
+            computed_capacity = int(rc_capacity)
+        else:
+            compute_fn = globals().get("_compute_capacity_from_deadline", None)
+            if callable(compute_fn):
+                try:
+                    res = compute_fn(proposal)
+                    if isinstance(res, (int, float)):
+                        computed_capacity = int(res)
+                except Exception:
+                    computed_capacity = None
+            else:
+                deadline_raw = safe_get(proposal, "deadline", "deadline_iso", "deadline_date", default=None)
+                if deadline_raw:
+                    try:
+                        if isinstance(deadline_raw, (date, datetime)):
+                            dd = deadline_raw if isinstance(deadline_raw, date) else deadline_raw.date()
+                        else:
+                            dd = datetime.strptime(str(deadline_raw), "%Y-%m-%d").date()
+                        today = date.today()
+                        if dd > today:
+                            days = (dd - today).days
+                            work_days = max(0, math.floor(days * (5.0/7.0)))
+                            computed_capacity = int(max(8, work_days * 8 * max(1, team_size))) if work_days > 0 else 0
+                        else:
+                            computed_capacity = 0
+                    except Exception:
+                        computed_capacity = None
+    except Exception:
+        computed_capacity = None
+    capacity_hours_available = computed_capacity if isinstance(computed_capacity, int) else None
+    # work_days used for add_fte formula
+    work_days = None
+    try:
+        deadline_raw = safe_get(proposal, "deadline", "deadline_iso", "deadline_date", default=None)
+        if deadline_raw:
+            if isinstance(deadline_raw, (date, datetime)):
+                dd = deadline_raw if isinstance(deadline_raw, date) else deadline_raw.date()
+            else:
+                dd = datetime.strptime(str(deadline_raw), "%Y-%m-%d").date()
+            today = date.today()
+            if dd > today:
+                days = (dd - today).days
+                work_days = max(0, math.floor(days * (5.0/7.0)))
+            else:
+                work_days = 0
+    except Exception:
+        work_days = None
+    # thresholds
+    too_short_threshold_h = 8
+    preferred_must_phase_h = 40
+    aggressive_compression_limit_pct = 30
+    min_phase_hours = 4
+    # mapping for Template
+    mapping = {
+        "client": client,
+        "provider": provider,
+        "project_goal": project_goal,
+        "scope": scope,
+        "techs": techs,
+        "team_size": str(team_size),
+        "team_composition_hint": team_composition_hint,
+        "audience": audience,
+        "deliverables_input_str": deliverables_input_str,
+        "phases_input_str": phases_input_str,
+        "rc_provided": "yes" if rc else "no",
+        "rc_planned": str(rc_planned) if rc_planned is not None else "null",
+        "rc_capacity": str(rc_capacity) if rc_capacity is not None else "null",
+        "rc_allow_overflow": "true" if rc_allow_overflow else "false",
+        "rc_requested_extension": str(rc_requested_extension) if rc_requested_extension is not None else "null",
+        "capacity_hours_available": str(capacity_hours_available) if capacity_hours_available is not None else "null",
+        "work_days": str(work_days) if work_days is not None else "null",
+        "too_short_threshold_h": str(too_short_threshold_h),
+        "preferred_must_phase_h": str(preferred_must_phase_h),
+        "aggressive_compression_limit_pct": str(aggressive_compression_limit_pct),
+        "min_phase_hours": str(min_phase_hours),
+        "tone": as_safe_str(tone or "Formal")
+    }
+    # --- The new, strict prompt template ---
+    prompt_template = dedent(r"""
+YOU MUST RETURN ONLY VALID JSON. NO MARKDOWN. NO TEXT OUTSIDE JSON.
+You are the Expert Committee for contractor "$provider", producing a Commercial Proposal for "$client".
+Follow the rules and schema below exactly. Use conservative professional judgment. Do NOT ask clarifying questions — make reasonable assumptions and record them in assumptions_text.
+Use a $tone tone in all narrative texts.
+INPUT (use verbatim when present):
+- project_goal: "$project_goal"
+- scope: "$scope"
+- tech_stack: "$techs"
+- declared_team_size: $team_size
+- audience: "$audience"
+- user_provided_deliverables: $deliverables_input_str
+- user_provided_phases: $phases_input_str
+- reality_check_provided: $rc_provided
+- reality_check.planned_effort_hours: $rc_planned
+- reality_check.team_capacity_hours: $rc_capacity
+- reality_check.allow_overflow: $rc_allow_overflow
+- computed_capacity_hours: $capacity_hours_available
+- computed_work_days: $work_days
+- aggressive_compression_limit_pct: $aggressive_compression_limit_pct
+IMPORTANT: ANSWER ONLY WITH A SINGLE VALID JSON OBJECT AND NOTHING ELSE. NO MARKDOWN, NO EXPLANATION, NO TEXT OUTSIDE THE JSON.
+MUST-HAVE OUTPUT FORMAT (STRICT JSON):
+Return EXACTLY one JSON object with these top-level keys in this order:
+1) team_structure
+2) suggested_phases
+3) suggested_deliverables
+4) visualization
+5) risks_text
+6) executive_summary_text (write 1-4 paragraphs)
+7) project_mission_text (write 1-4 paragraphs)
+8) all other narrative fields (technical_backend_text, technical_deployment_text, engagement_model_text, delivery_approach_text, team_structure_text, status_reporting_text, phases_summary_text, qa_strategy_text, qa_testing_types_text, financial_justification_text, payment_terms_text, development_note, licenses_note, support_note, assumptions_text)
+9) metadata
+*** GLOBAL CONSTRAINTS & RULES (ABSOLUTE) ***
+                             # В prompt_parts, перед "ADDITIONAL GUIDANCE:", добавить:
+"IMPORTANT: Do not include the client or provider company name (or any signatures, footers, or repeated mentions) at the end of any text field. The template handles company information separately. Keep all text fields clean and focused on content only."
+- YOU MUST RETURN VALID JSON ONLY. No Markdown, no commentary.
+- team_structure MUST exactly describe real team members and roles and MUST match declared_team_size:
+   - If team_size < logical roles, fill extra slots with explicit placeholders: { "name": "TBD", "role":"TBD", "skills":[], "seniority":"junior" }.
+   - Do NOT invent extra named roles beyond team_size.
+- All arrays required by schema MUST be JSON arrays; do not output text bullets or markdown.
+- All role names referenced in suggested_phases.preferred_role MUST be exact matches to team_structure.role values.
+- milestones and phases_list (if both used) MUST be identical arrays. If trimmed, add trimmed names to metadata.dropped_phases.
+- If any numeric input is missing, set corresponding numeric outputs to null and list missing items in assumptions_text.
+- Ensure all sections are consistent with team_structure, suggested_phases, and metadata. No contradictions or hallucinations. Phase counts must match across phases_summary_text and suggested_phases; consolidate to <=8 phases if necessary, documenting in assumptions_text.
+- Incorporate best practices from professional IT proposals, such as client-centric language, value propositions, and clear call to action in executive_summary_text. Avoid repetitive insertions like client name at section ends.
+- Ensure financial sections are consistent and realistic; do not invent costs—use "estimated based on assumptions" if needed.
+-
+=== REQUIRED: team_structure ===
+Return an array `team_structure` of length == declared_team_size ($team_size).
+Each element MUST be an object with exactly these keys:
+{
+  "member_id": str,           # unique id (e.g., "pm-1" or "u123") OR null if unknown
+  "role": str,                # canonical role name (e.g., "Project Manager")
+  "skills": [str,...],        # non-empty array; tokens (e.g., "api","shopify","ci/cd")
+  "seniority": "junior|mid|senior|lead",
+  "capacity_hours_per_week": int|null   # optional but preferred
+}
+- Roles must be concise names (Project Manager, Solution Architect, Backend Engineer, QA Engineer, DevOps, Frontend Engineer).
+- Skills must be normalized tokens (lowercase, no spaces preferred; use hyphen if needed).
+- If a field is unknown, use null; however role must be provided.
+=== REQUIRED: suggested_phases ===
+- Return `suggested_phases` as an ARRAY (len <= 8). Each element MUST exactly contain:
+{
+  "phase_name": str,
+  "description": str,
+  "tasks": str,
+  "effort_hours": int,            # canonical man-hours for the phase (integer)
+  "duration_weeks": int|null,     # duration consistent with effort_hours (see CONSISTENCY RULES)
+  "start": str|null,              # ISO date (YYYY-MM-DD) or null
+  "end": str|null,                # ISO date or null
+  "original_hours": int|null,     # if adjusted; else null
+  "preferred_role": str,          # MUST match one of team_structure.role exactly
+  "required_skills": [str,...],   # non-empty array used for role mapping
+  "depends_on": [str,...],        # names of other phases (phase_name strings)
+  "priority": "must|should|optional",
+  "owner_member_id": str|null     # assigned owner member_id (if assigned by LLM); else null
+}
+- effort_hours must be integer >= 8 unless justified in assumptions_text.
+- duration_weeks, if present, MUST be consistent with effort_hours (duration_weeks * team_size * 40 should approximate effort_hours — see CONSISTENCY RULES).
+- preferred_role MUST be one of roles from team_structure.
+- required_skills MUST be specific skill tokens (e.g., ["api","openapi","data-mapping"]).
+=== PHASES DUPLICATION RULE ===
+- Also include `phases_list` field as an EXACT COPY of suggested_phases (for backward compatibility): phases_list == suggested_phases.
+=== REQUIRED: suggested_deliverables ===
+- Array length <= 12. Each deliverable:
+{ "title": str, "description": str, "acceptance_criteria": str }
+=== REQUIRED: visualization ===
+- Object with keys:
+{
+  "components": [...],
+  "milestones": [ { "name":str, "start":str|null, "end":str|null, "owner_role":str, "owner_member_id": str|null } , ... ],
+  "infrastructure": [...],
+  "data_flows": [...],
+  "connections": [...],
+  "gantt_team_members": [ { "member_id":str, "name":str, "role":str } , ... ]   # MUST contain exact list of team_structure members
+  "uml_structure": {  # REQUIRED: Generate UML for technical architecture
+    "components": [  # List of dicts for system components
+      { "id": str, "name": str, "stereotype": str, "responsibilities": [str,...], "attributes": [str,...], "notes": str }
     ],
-    "suggested_phases": [
-        // (List of Phases from PM. Detailed and matches milestones)
-        {{"phase_name": "Phase 1: Analysis and Design (Discovery)", "duration_hours": 8, "tasks": "Requirements gathering, finalization of specifications, architecture design, environment setup."}},
-        {{"phase_name": "Phase 2: Development (Implementation Sprints)", "duration_hours": 8, "tasks": "Backend API development, integration with CRM/E-commerce, UI development (if applicable), Unit tests."}},
-        {{"phase_name": "Phase 3: Stabilization and UAT", "duration_hours": 16, "tasks": "Comprehensive QA, API testing, UAT (User Acceptance Testing), bug fixing."}},
-        {{"phase_name": "Phase 4: Deployment and Support", "duration_hours": 24, "tasks": "Deployment to Production, training, handover of documentation, launch of support."}}
-    ],
+    "relations": [  # List of dicts for connections
+      { "from": str, "to": str, "type": str, "label": str }
+    ]
+  }
+}
+- Generate uml_structure based on tech_stack, scope, and suggested_phases. Use 8-12 components (e.g., API, Database, Workers). Relations as dependencies (type: "dependency"). Stereotypes: service, database, worker, etc.
+- If start/end unknown, set them to null. Use effort_hours as canonical sizing.
+- `gantt_team_members` MUST include every member from `team_structure` in the same order; do not omit.
+- For diagrams (e.g., lifecycle, UML), describe them in relevant narrative texts if not generating visuals.
+"- For UML, generate 'uml_structure' with 'components' (list of dicts: id, name, stereotype, responsibilities, attributes, notes) and 'relations' (list of dicts: from, to, type, label)."
+=== RISKS ===
+- Provide risks_text grouped exactly as:
+  "High Risks:\n- <bullet>\n\nMedium Risks:\n- <bullet>\n\nLow Risks:\n- <bullet>\n"
+- Phase-level risks MUST appear under appropriate group first.
+- Additionally produce metadata.phase_risks (only if any phases flagged) as array of objects:
+  { "phase_name","duration_hours","risk_level","reason","likelihood","impact","mitigations","additional_hours_needed","recommended_action","affected_downstream_phases" }
+=== CONSISTENCY & VALIDATION RULES (ENFORCED) ===
+- effort_hours MUST be numeric integer; duration_weeks if present MUST satisfy:
+    |effort_hours - (duration_weeks * declared_team_size * 40)| <= 0.25 * effort_hours
+  Otherwise: set duration_weeks to null and document adjustment in assumptions_text.
+- start/end date inference must respect dependencies: if A depends_on B then A.start >= B.end (if known). If conflict, set dates to null and document in metadata.conflicts.
+- owner_member_id MUST correspond to a member in team_structure (member_id). If assignment impossible, owner_member_id must be null and mark recommendation in metadata.owner_unassigned_phases.
+- preferred_role MUST be exactly one of the roles in team_structure.
+- All strings must escape newlines as '\\n'.
+=== ADAPTATION ALGORITHM (ENFORCED, run if baseline > capacity) ===
+1) Baseline = SUM(suggested_phases[*].effort_hours) -> metadata.total_hours_realistic (integer).
+2) Compare Baseline to capacity (prefer reality_check.team_capacity_hours if provided; else computed_capacity_hours).
+3) If Baseline <= capacity -> metadata.deadline_feasible = true.
+4) If Baseline > capacity:
+   A) Attempt logical parallelization/re-sequencing (document calendar impact).
+   B) Compress 'should' or 'optional' phases up to $aggressive_compression_limit_pct% each (document compression_pct per phase).
+   C) Drop optional phases and add names to metadata.dropped_phases.
+   D) If still > capacity:
+      - If reality_check.allow_overflow is true: metadata.allow_overflow_used=true and propose overflow_plan (numeric hours & mitigations).
+      - Else: choose ONE primary_recommendation from {extend_deadline, add_fte, compress_scope}. Provide numeric rationale.
+   E) When recommending extend_deadline, compute:
+      suggested_deadline_extension_days = ceil(overflow_hours / (team_size * 8))
+   F) When recommending add_fte:
+      additional_FTEs_required = ceil(overflow_hours / (work_days * 8)) if work_days known else ceil(overflow_hours / (20*8))
+- All formulas and numeric results MUST appear in metadata (both formula string and numeric result).
+=== AGENT-LOGIC & OWNER ASSIGNMENT RULES (STRICT) ===
+- The agent must assign owner_member_id deterministically using:
+   score = w_skill * skill_match_score + w_seniority * seniority_score + w_load * availability_score + w_affinity * role_affinity_score
+- skill_match_score = normalized count of required_skills intersect member.skills (weighted by proficiency if present).
+- seniority_score: map junior=0.5, mid=1.0, senior=1.2, lead=1.4.
+- availability_score: uses capacity_hours_per_week and current load; if unknown assume neutral (1.0) but document in assumptions_text.
+- role_affinity_score = 1.0 if member.role == preferred_role else 0.7 if related, else 0.5.
+- Tie-breaker MUST be deterministic: use hash(phase_name + member_id) modulo to pick highest hashed id among equals (no randomness).
+- Do NOT assign owners to roles not present in team_structure.
+- If no member reaches a minimum score threshold (configurable default 0.5), set owner_member_id=null and mark in metadata.owner_unassigned_phases.
+=== API RATE-LIMIT & VERIFICATION REQUIREMENTS ===
+- Identify external APIs from tech_stack/scope. For each vendor provide:
+  { "vendor": str, "value": int|"unknown", "unit": str, "confidence": "low|medium|high", "source_url": str|"unknown", "verification_steps": str, "operational_recommendation": str, "tariff_info": str|"unknown" }
+- If unknown, include concrete curl examples and header names to check.
+- Include tariff considerations (e.g., cost per API call, storage fees) in tariff_info and reference in financial_justification_text where applicable.
+TEAM-SIZE RULES (CRITICAL & MANDATORY)
+    * **CURRENT INPUT TEAM SIZE: $team_size FTEs.**
+    * $team_composition_hint
+    * If `team_size` > 1, section `team_structure_text` MUST list exactly $team_size distinct roles with specific responsibilities.
+    * Do NOT output "Given the team_size of 1" if the input is $team_size.
+    * Adjust the `delivery_approach_text` to reflect parallel work streams possible with $team_size people.
+    * ALWAYS include a `what_if_6FTE` block in metadata (even if current size is 6, just reaffirm feasibility).
+=== TECHNICAL SECTIONS & APPENDIX RULES ===
+- Provide `technical_backend_text` (high-level) aligned to phases and team.
+- If you include detailed numeric tuning (>3 numeric tuning parameters), move them into `appendix_technical_spec` and set metadata.appendix_present = true.
+- `appendix_technical_spec` must be labeled "Technical Appendix — for engineering teams only".
+- Be concrete and decisive in recommendations, do not use phrases like "for example" or "such as" for core components; choose one primary option and justify.
+- Specify all necessary tools, setups, and configurations to ensure the solution works as expected for the client, evaluating options where relevant and selecting the optimal one with justification.
+- Provide a concrete `technical_backend_text` focused on the project, including architecture descriptions, data flows, storage strategy, worker design, security, observability, deployment artifacts, CI/CD pipeline, and operational runbook, without code examples.
+=== RISK & ASSUMPTIONS RULES ===
+- assumptions_text must be client-facing, one per line.
+- internal notes must go to metadata.internal_notes (if any).
+- If any required numeric input is missing set numeric outputs to null and list missing items in assumptions_text.
+=== FINAL VALIDATION (must be satisfied by your answer) ===
+- metadata.total_hours_realistic == SUM(suggested_phases[*].effort_hours) (integers). If coercion applied, document in metadata.risk_message and assumptions_text.
+- len(suggested_phases) <= 8; len(suggested_deliverables) <= 12. If trimmed, add dropped names to metadata.dropped_phases.
+- All owners in phases MUST be member_ids from team_structure. If not possible, set owner_member_id to null and explain in assumptions_text.
+- metadata must include all required fields listed below.
+=== AUDIENCE RULE ===
+- If audience == "executive": keep technical_backend_text high-level and put operational tuning to appendix_technical_spec.
+- If audience == "technical_lead" or "mixed": include high-level technical with appendix for tuning.
+- Tailor the entire proposal to the audience, incorporating best practices from similar professional documents for structure, clarity, and persuasion.
+=== HALLUCINATION GUARD ===
+- Do NOT invent capacities, vendor limits, tariffs, cost figures, or financial numbers. If unknown, set "unknown" and include exact verification steps + responsible role.
+=== OUTPUT SCHEMA (metadata fields required) ===
+metadata must include at least:
+{
+  "total_hours_realistic": int,
+  "capacity_hours_available": int|null,
+  "deadline_feasible": bool,
+  "risk_message": str,
+  "dropped_phases": [str,...],
+  "allow_overflow_requested": bool,
+  "allow_overflow_used": bool,
+  "overflow_hours": int,
+  "overflow_plan": object|null,
+  "reality_check_used": bool,
+  "suggested_deadline_extension_days": int|null,
+  "used_minimum_deadline": bool,
+  "primary_recommendation": "extend_deadline|add_fte|compress_scope|accept_risk_with_mitigation",
+  "primary_recommendation_rationale": str,
+  "additional_FTEs_required": int|null,
+  "api_rate_limits": [...],
+  "phase_risks": [...],          # optional, only if any
+  "owner_unassigned_phases": [...], # list of phase_names with unassigned owner_member_id
+  "conflicts": [...],            # date/dependency conflicts if any
+  "assumptions_internal_count": int
+}
+END OF RULES.
+Produce the JSON object now following the schema above.
+""")
+    # safe Template usage
+    try:
+        tmpl = Template(prompt_template)
+    except Exception as exc:
+        logger.exception("Template creation failed: %s", exc)
+        return (
+            '{"error":"prompt-template-failed","message":"internal generator error"}'
+        )
+    try:
+        prompt_filled = tmpl.safe_substitute(mapping)
+    except Exception as exc:
+        logger.exception("Template substitution failed: %s", exc)
+        prompt_filled = (
+            '{"error":"prompt-substitute-failed","message":"substitution failed; provide basic schema in output"}'
+        )
+    # final guard
+    if not isinstance(prompt_filled, str) or not prompt_filled.strip():
+        return '{"error":"prompt-empty-fallback","message":"failed to construct prompt"}'
+    return prompt_filled
 
-    // --- Data for Diagrams (Synchronized with agents) ---
-    "visualization": {{
-        "components": [
-            // (List of Components from Solution Architect)
-            {{"id": "user", "title": "User (Admin)", "description": "...", "type": "ui", "depends_on": []}},
-            {{"id": "frontend", "title": "Frontend ({frontend_tech})", "description": "...", "type": "ui", "depends_on": ["user"]}},
-            {{"id": "api_gw", "title": "API Gateway ({backend_tech})", "description": "...", "type": "service", "depends_on": ["frontend"]}},
-            {{"id": "crm_sync", "title": "CRM Synchronization Service", "description": "...", "type": "service", "depends_on": ["api_gw"]}},
-            {{"id": "db", "title": "PostgreSQL Database", "description": "...", "type": "db", "depends_on": ["api_gw", "crm_sync"]}}
-        ],
-        "milestones": [
-            // (List of Milestones from PM, EXACTLY MATCHES suggested_phases)
-            {{"name": "Phase 1: Analysis and Design (Discovery)", "start": null, "end": null, "duration_days": 21, "percent_complete": 0, "owner": "Project Manager"}},
-            {{"name": "Phase 2: Development (Implementation Sprints)", "start": null, "end": null, "duration_days": 56, "percent_complete": 0, "owner": "Backend Engineer"}},
-            {{"name": "Phase 3: Stabilization and UAT", "start": null, "end": null, "duration_days": 21, "percent_complete": 0, "owner": "QA Engineer"}},
-            {{"name": "Phase 4: Deployment and Support", "start": null, "end": null, "duration_days": 14, "percent_complete": 0, "owner": "DevOps"}}
-        ],
-        "infrastructure": [],
-        "data_flows": [],
-        "connections": []
-    }}
-}}
-"""
-    return prompt.strip()
+def _compute_capacity_from_deadline(proposal: Dict[str, Any]) -> Optional[int]:
+    """
+    Compute team capacity in hours using same logic as Streamlit but with exact workday counting.
+    Returns int or None if cannot compute.
+    """
+    try:
+        deadline_raw = proposal.get("deadline") or proposal.get("deadline_date") or ""
+        if not deadline_raw:
+            return None
+        if isinstance(deadline_raw, (date, datetime)):
+            deadline_date = deadline_raw if isinstance(deadline_raw, date) else deadline_raw.date()
+        else:
+            deadline_date = datetime.strptime(str(deadline_raw), "%Y-%m-%d").date()
+        today = date.today()
+        if deadline_date <= today:
+            return 0
+        work_days = _count_workdays(today, deadline_date)
+        available_hours_single = work_days * 8
+        team_size = int(proposal.get("team_size", 1) or 1)
+        total_capacity = int(max(0, available_hours_single * team_size))
+        if work_days > 0 and total_capacity < 8:
+            total_capacity = 8
+        return total_capacity
+    except Exception:        return None
 
 
 def _extract_text_from_openai_response(resp: Any) -> str:
 
+    """
+    Always return a JSON/text string. If the client returned structured content (dict/list),
+    dump to JSON string. Fallback to str(resp).
+    """
     try:
         # handle new-client structured response
         if isinstance(resp, dict):
@@ -708,79 +930,130 @@ Generate a realistic, logical sequence of lifecycle stages for the project.
         expected_json_type=list # Ожидаем JSON list
     )
 
+def _generate_uml_with_agent(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Генерирует структуру UML (JSON с keys: components, relations) через общий _invoke_with_fallback.
+    Возвращает dict с указанной структурой или детерминированный stub в случае фолбэка.
+    """
+    project_goal = data.get("project_goal", "generic AI project")
+    client_name = data.get("client_name", data.get("client", "Generic client"))
+    technologies = data.get("technologies") or []
+    tech_str = ", ".join(technologies) if isinstance(technologies, (list, tuple)) else str(technologies)
+
+    prompt = f"""
+You are an expert solution architect. Using ONLY the context below, produce EXACTLY ONE JSON object (and nothing else)
+describing the **system components** and **relations** for the project.
+
+Context:
+- Project goal: "{project_goal}"
+- Client: "{client_name}"
+- Technologies: {tech_str}
+
+**Output instructions (STRICT):**
+Return exactly one JSON object with TWO keys: "components" and "relations".
+
+- "components": array of objects with keys:
+  - id (string, unique)
+  - name (string)
+  - stereotype (string, e.g. "service", "database", "worker", "frontend", "pipeline")
+  - responsibilities (array of short strings) -- mark inferred items with "(inferred)" if unsure
+  - attributes (array of short strings)
+  - notes (string)
+
+- "relations": array of objects with keys:
+  - from (component id)
+  - to (component id)
+  - type (one of "dependency","association","aggregation","composition","inherits")
+  - label (short string, may be empty)
+
+Return JSON only. Example:
+{{"components":[{{"id":"ui","name":"User UI","stereotype":"frontend","responsibilities":["display results"]}}],"relations":[{{"from":"ui","to":"api","type":"dependency","label":"calls"}}]}}
+"""
+
+    # Deterministic fallback stub (returned by _invoke_with_fallback if LLMs fail)
+    stub = {
+        "components": [
+            {"id": "ui", "name": "User Interface", "stereotype": "frontend",
+             "responsibilities": ["user interactions (inferred)"], "attributes": [], "notes": ""},
+            {"id": "api", "name": "API Service", "stereotype": "service",
+             "responsibilities": ["business logic (inferred)"], "attributes": [], "notes": ""},
+            {"id": "db", "name": "Primary Database", "stereotype": "database",
+             "responsibilities": ["persistent storage (inferred)"], "attributes": [], "notes": ""}
+        ],
+        "relations": [
+            {"from": "ui", "to": "api", "type": "dependency", "label": "HTTP calls"},
+            {"from": "api", "to": "db", "type": "dependency", "label": "reads/writes"}
+        ]
+    }
+
+    # Use the same centralized fallback/invoke helper as lifecycle stages
+    # expected_json_type = dict ensures the wrapper validates top-level JSON is an object
+    return _invoke_with_fallback(
+        prompt=prompt,
+        stub_value=stub,
+        expected_json_type=dict
+    )
+
+def _count_workdays(start_date: date, end_date: date) -> int:
+    """
+    Count business days from start_date (exclusive) to end_date (inclusive).
+    Returns 0 if end_date <= start_date.
+    """
+    if not isinstance(start_date, date) or not isinstance(end_date, date):
+        return 0
+    if start_date >= end_date:
+        return 0
+    days = (end_date - start_date).days
+    # Fast approach: full weeks + leftover days
+    full_weeks, extra_days = divmod(days, 7)
+    workdays = full_weeks * 5
+    # handle leftover
+    for i in range(1, extra_days + 1):
+        if (start_date + _td(days=i)).weekday() < 5:
+            workdays += 1
+    return workdays
 
 def generate_ai_json(proposal: Dict[str, Any], tone: str = "Formal") -> str:
-    """
-    Modify the function to check for lifecycle stages and generate them if missing.
-    """
     if OPENAI_USE_STUB:
-        # Create a deterministic stub compatible with the schema (fallback data)
         client = proposal.get("client_company_name", "Client")
-        stub = {
-            "executive_summary_text": f"Fallback executive summary for {client}.",
-            "project_mission_text": "Deliver a reliable solution.",
-            "solution_concept_text": "Modular microservices architecture.",
-            "project_methodology_text": "Agile with 2-week sprints.",
-            "financial_justification_text": "ROI and efficiency gained.",
-            "payment_terms_text": "50% upfront, 50% on delivery.",
-            "development_note": "Covers development and QA.",
-            "licenses_note": "Typical SaaS licenses.",
-            "support_note": "3 months of post-launch support.",
-            "suggested_deliverables": [],
-            "suggested_phases": [],
-            "visualization": {
-                "components": [],
-                "infrastructure": [],
-                "data_flows": [],
-                "connections": [],
-                "milestones": []
-            }
-        }
+        stub = {"executive_summary_text": f"Fallback for {client}.", "suggested_deliverables": [], "suggested_phases": [], "visualization": {}, "metadata": {}}
         return json.dumps(stub, ensure_ascii=False)
 
-    # Check if lifecycle stages exist in the proposal
-    lifecycle_stages = proposal.get("lifecycle_stages", [])
-    if not lifecycle_stages:
-        logger.info("No lifecycle stages provided, using agent to generate stages.")
-        # Здесь мы используем агент для генерации этапов жизненного цикла
-        lifecycle_stages = _generate_lifecycle_stages_with_agent(proposal)
+    # ensure lifecycle stages
+    if not proposal.get("lifecycle_stages"):
+        try:
+            proposal["lifecycle_stages"] = _generate_lifecycle_stages_with_agent(proposal)
+        except Exception:
+            # keep going even if lifecycle generation fails
+            proposal.setdefault("_meta", {}).setdefault("warnings", []).append("lifecycle_generation_failed")
 
-    # Ensure lifecycle stages are present
-    if not lifecycle_stages:
-        logger.error("No lifecycle stages available after agent generation")
-        # Возвращаем детерминированный фоллбэк для консистентности, хотя лучше поднять ошибку
-        return _invoke_with_fallback("", FALLBACK_AI_JSON_DICT_MINIMAL, expected_json_type=str)
-        # raise ValueError("No lifecycle stages available")
+    # ensure UML structure exists (use central helper which has fallback)
+    if not proposal.get("uml_structure"):
+        try:
+            proposal["uml_structure"] = _generate_uml_with_agent(proposal)
+        except Exception:
+            proposal.setdefault("_meta", {}).setdefault("warnings", []).append("uml_generation_failed")
 
     prompt = _build_prompt(proposal, tone)
-    
-    # Try cached fast path (KEEPING CACHE LOGIC HERE as it's separate from live invocation/fallback)
     try:
         cached = _invoke_openai_cached(prompt, OPENAI_MODEL)
         if cached:
-            # Try to parse as JSON (to ensure it's not malformed)
             try:
                 json.loads(cached)
                 return cached
             except Exception:
-                # Not strict JSON, still use it as text (this decision is kept from original)
                 return cached
     except Exception:
         pass
 
-
-    return _invoke_with_fallback(
-        prompt=prompt,
-        stub_value=FALLBACK_AI_JSON_DICT_MINIMAL, 
-        expected_json_type=str
-    )
-
+    res = _invoke_with_fallback(prompt=prompt, stub_value=FALLBACK_AI_JSON_DICT_MINIMAL, expected_json_type=str)
+    return res if isinstance(res, str) else json.dumps(res, ensure_ascii=False)
 
 def generate_suggestions(
     proposal: Dict[str, Any],
     tone: str = "Formal",
-    max_deliverables: int = 10,
-    max_phases: int = 10
+    max_deliverables: int = 20,
+    max_phases: int = 20
 ) -> Dict[str, Any]:
     """
     Return a dict with 'suggested_deliverables' and 'suggested_phases'.
@@ -849,15 +1122,18 @@ def generate_suggestions(
             cached = _invoke_openai_cached(prompt, OPENAI_MODEL)
         except Exception:
             cached = None
-        
+
         if cached:
-            # cached is raw text; try parse JSON
             try:
                 parsed = _clean_and_parse_json(cached, dict)
                 if isinstance(parsed, dict):
+                    parsed = _postprocess_suggestion_result(parsed, proposal, max_phases=max_phases, max_deliverables=max_deliverables)
                     return {
                         "suggested_deliverables": parsed.get("suggested_deliverables", []),
-                        "suggested_phases": parsed.get("suggested_phases", [])
+                        "suggested_phases": parsed.get("suggested_phases", []),
+                        "metadata": parsed.get("metadata", {}),
+                        "risks_text": parsed.get("risks_text", ""),
+                        "assumptions_text": parsed.get("assumptions_text", "")
                     }
             except Exception:
                 pass
@@ -867,168 +1143,643 @@ def generate_suggestions(
     parsed_result = _invoke_with_fallback(
         prompt=prompt,
         stub_value=stub_data,
-        expected_json_type=dict 
+        expected_json_type=dict
     )
 
+    # postprocess to ensure consistency
+    try:
+        parsed_result = _postprocess_suggestion_result(parsed_result, proposal, max_phases=max_phases, max_deliverables=max_deliverables)
+    except Exception:
+        logger.exception("Postprocessing suggestion result failed; returning raw parsed_result")
 
     return {
         "suggested_deliverables": parsed_result.get("suggested_deliverables", []),
-        "suggested_phases": parsed_result.get("suggested_phases", [])
+        "suggested_phases": parsed_result.get("suggested_phases", []),
+        "metadata": parsed_result.get("metadata", {}),
+        "risks_text": parsed_result.get("risks_text", ""),
+        "assumptions_text": parsed_result.get("assumptions_text", "")
     }
 
+def _postprocess_suggestion_result(parsed: Dict[str, Any], proposal: Dict[str, Any], max_phases: int = 20, max_deliverables: int = 20) -> Dict[str, Any]:
+    """
+    Ensure parsed suggestion dict conforms to schema invariants:
+     - durations ints >=4
+     - metadata.total_hours_realistic equals sum(suggested_phases.duration_hours)
+     - compute overflow_hours and suggested_deadline_extension_days based on reality_check / computed capacity
+     - ensure keys exist
+    """
+    if not isinstance(parsed, dict):
+        return parsed  # leave to caller's error handling
 
+    # ensure keys
+    parsed.setdefault("suggested_phases", [])
+    parsed.setdefault("suggested_deliverables", [])
+    parsed.setdefault("metadata", {})
+    parsed.setdefault("risks_text", "")
+    parsed.setdefault("assumptions_text", "")
 
+    # normalize phases
+    phases = parsed["suggested_phases"]
+    normalized_phases = []
+    for p in phases[:max_phases]:
+        # ensure shape
+        phase_name = p.get("phase_name") or p.get("name") or "Phase"
+        duration = p.get("duration_hours") or p.get("duration") or 0
+        try:
+            duration = int(float(duration))
+        except Exception:
+            duration = 0
+        # enforce minimum 4h unless explicitly 0 (but LLM generally shouldn't give 0)
+        if duration > 0:
+            duration = max(4, duration)
+        owner = p.get("owner") or p.get("resource") or "Engineering"
+        tasks = p.get("tasks") or p.get("description") or ""
+        priority = p.get("priority") or "must"
+        normalized_phases.append({
+            "phase_name": str(phase_name),
+            "duration_hours": int(duration),
+            "tasks": str(tasks),
+            "owner": str(owner),
+            "priority": str(priority)
+        })
+    parsed["suggested_phases"] = normalized_phases
+    # ---- deterministic enforcement to fit capacity (server-side) ----
+    try:
+        # Получаем capacity: приоритет — reality_check.team_capacity_hours, иначе — вычисление из дедлайна
+        rc = None
+        try:
+            rc = _extract_reality_check(proposal) or {}
+        except Exception:
+            rc = proposal.get("reality_check") or {}
+
+        rc_capacity = None
+        if rc and rc.get("team_capacity_hours") is not None:
+            try:
+                rc_capacity = int(rc.get("team_capacity_hours"))
+            except Exception:
+                rc_capacity = None
+
+        # fallback compute from deadline if rc_capacity is None
+        if rc_capacity is None:
+            try:
+                computed = _compute_capacity_from_deadline(proposal)
+                if isinstance(computed, (int, float)):
+                    rc_capacity = int(computed)
+            except Exception:
+                rc_capacity = None
+
+        # team size fallback
+        try:
+            team_size = int(proposal.get("team_size") or 1)
+        except Exception:
+            team_size = 1
+
+        # enforce only when capacity known and allow_overflow is False
+        allow_overflow_flag = bool(rc.get("allow_overflow")) if isinstance(rc, dict) else bool(proposal.get("allow_overflow", False))
+        if rc_capacity is not None and not allow_overflow_flag:
+            original_phases = parsed.get("suggested_phases", [])
+            adjusted_phases, enforcement_info = _enforce_capacity_on_phases(
+                original_phases,
+                rc_capacity,
+                team_size,
+                aggressive_pct=int(parsed.get("metadata", {}).get("aggressive_compression_limit_pct", 30)),
+                min_phase_hours=int(parsed.get("metadata", {}).get("min_phase_hours", 4))
+            )
+            # apply adjustments
+            parsed["suggested_phases"] = adjusted_phases
+            # compute new total_hours_realistic
+            new_total = sum(int(p.get("duration_hours") or 0) for p in adjusted_phases)
+            parsed.setdefault("metadata", {})
+            parsed["metadata"]["total_hours_realistic"] = int(new_total)
+            parsed["metadata"]["capacity_hours_available"] = int(rc_capacity)
+            parsed["metadata"].setdefault("dropped_phases", [])
+            parsed["metadata"]["dropped_phases"].extend(enforcement_info.get("dropped_phases", []))
+            parsed["metadata"]["allow_overflow_used"] = False
+            parsed["metadata"]["enforcement"] = enforcement_info
+            parsed["metadata"]["overflow_hours"] = int(enforcement_info.get("overflow_hours", 0))
+            # If enforcement produced any compressions/drops, produce phase_risks entries
+            phase_risks = []
+            for c in enforcement_info.get("compressions", []):
+                phase_risks.append({
+                    "phase_name": c["phase"],
+                    "duration_hours": next((p["duration_hours"] for p in adjusted_phases if p["phase_name"] == c["phase"]), None),
+                    "risk_level": "medium",
+                    "reason": f"Phase compressed by {c['reduced_hours']} hours to fit capacity",
+                    "mitigations": "Increase parallelisation, extend deadline or add FTEs",
+                    "additional_hours_needed": 0,
+                    "recommended_action": "Monitor in PHASE RISKS",
+                    "affected_downstream_phases": []
+                })
+            for d in enforcement_info.get("dropped_phases", []):
+                phase_risks.append({
+                    "phase_name": d,
+                    "duration_hours": None,
+                    "risk_level": "high",
+                    "reason": "Phase dropped to fit capacity",
+                    "mitigations": "Consider extend_deadline or add_fte to restore scope",
+                    "additional_hours_needed": None,
+                    "recommended_action": "List in PHASE RISKS and escalate",
+                    "affected_downstream_phases": []
+                })
+            if phase_risks:
+                parsed["metadata"]["phase_risks"] = phase_risks
+                # Prepend phase-level bullets to risks_text (if exists) or create
+                existing_risks = parsed.get("risks_text", "")
+                phase_bullets = []
+                for r in phase_risks:
+                    phase_bullets.append(f"- {r['phase_name']}: {r['reason']}; mitigation: {r['mitigations']}")
+                parsed["risks_text"] = ("\n".join(phase_bullets) + ("\n\n" + existing_risks if existing_risks else ""))
+        else:
+            # if capacity unknown, set metadata.capacity_hours_available=null
+            parsed.setdefault("metadata", {})
+            parsed["metadata"].setdefault("capacity_hours_available", None)
+    except Exception as e:
+        # не ломаем основную генерацию — логируем и продолжаем
+        try:
+            logger = globals().get("logger")
+            if logger:
+                logger.exception("Capacity enforcement failed: %s", e)
+        except Exception:
+            pass
+    # ---- end enforcement block ----
+
+    # Enforce capacity deterministically if capacity known and overflow > 0 and allow_overflow is False
+    rc = _extract_reality_check(proposal)
+    capacity = rc.get("team_capacity_hours") if rc.get("team_capacity_hours") is not None else _compute_capacity_from_deadline(proposal)
+    team_size = int(proposal.get("team_size", 1) or 1)
+    parsed["metadata"].setdefault("enforcement", {})
+
+    # Only enforce when capacity is numeric and LLM plan exceeds capacity and allow_overflow not requested
+    if capacity is not None:
+        adjusted_phases, enforcement_info = _enforce_capacity_on_phases(parsed["suggested_phases"], int(capacity), team_size, aggressive_pct=aggressive_compression_limit_pct, min_phase_hours=min_phase_hours)
+        parsed["suggested_phases"] = adjusted_phases
+        # recompute total_hours after enforcement
+        total_hours = sum(int(p.get("duration_hours") or 0) for p in parsed["suggested_phases"])
+        parsed["metadata"]["enforcement"] = enforcement_info
+
+    # normalize deliverables (truncate to max_deliverables)
+    dels = parsed.get("suggested_deliverables", [])[:max_deliverables]
+    parsed["suggested_deliverables"] = dels
+
+    # compute totals
+    total_hours = sum(int(p.get("duration_hours") or 0) for p in parsed["suggested_phases"])
+    meta = parsed["metadata"]
+    meta_total = meta.get("total_hours_realistic")
+    try:
+        meta_total = int(meta_total) if meta_total is not None else None
+    except Exception:
+        meta_total = None
+    # override metadata value to be consistent
+    meta["total_hours_realistic"] = int(total_hours)
+
+    # capacity
+    rc = _extract_reality_check(proposal)
+    capacity = rc.get("team_capacity_hours")
+    if capacity is None:
+        capacity = _compute_capacity_from_deadline(proposal)
+
+    meta["capacity_hours_available"] = int(capacity) if capacity is not None else None
+    meta["reality_check_used"] = bool(rc.get("planned_effort_hours") or rc.get("team_capacity_hours") or rc.get("requested_deadline_extension_days"))
+
+    # overflow calc
+    overflow = 0
+    if capacity is not None:
+        overflow = max(0, int(total_hours) - int(capacity))
+    meta["overflow_hours"] = int(overflow)
+    allow_overflow_requested = bool(rc.get("allow_overflow", False))
+    meta["allow_overflow_requested"] = allow_overflow_requested
+    # determine allow_overflow_used and final feasibility
+    if overflow > 0:
+        if allow_overflow_requested:
+            meta["allow_overflow_used"] = True
+            meta["deadline_feasible"] = True
+        else:
+            meta["allow_overflow_used"] = False
+            meta["deadline_feasible"] = False
+            # add risk message if empty
+            if not meta.get("risk_message"):
+                meta["risk_message"] = f"Plan requires {total_hours}h but capacity is {capacity}h."
+    else:
+        meta["allow_overflow_used"] = False
+        meta["deadline_feasible"] = True
+        if not meta.get("risk_message"):
+            meta["risk_message"] = ""
+
+    # suggested_deadline_extension_days when overflow exists
+    if overflow > 0 and capacity and proposal.get("team_size", 1):
+        per_day_capacity = int(proposal.get("team_size", 1)) * 8
+        if per_day_capacity > 0:
+            meta["suggested_deadline_extension_days"] = int(math.ceil(overflow / per_day_capacity))
+        else:
+            meta["suggested_deadline_extension_days"] = None
+    else:
+        meta["suggested_deadline_extension_days"] = meta.get("suggested_deadline_extension_days")
+
+    parsed["metadata"] = meta
+    return parsed
+# END PATCH
+
+def _extract_reality_check(proposal: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract canonical reality-check fields from the incoming proposal payload.
+    Accepts several input shapes (streamlit form, top-level keys, or nested dict).
+    Returns dict with integer fields:
+      {
+        "planned_effort_hours": int or None,
+        "team_capacity_hours": int or None,
+        "delta_hours": int or None,
+        "allow_overflow": bool,
+        "requested_deadline_extension_days": int or None
+      }
+    """
+    rc = proposal.get("reality_check") or proposal.get("reality") or {}
+    out = {
+        "planned_effort_hours": None,
+        "team_capacity_hours": None,
+        "delta_hours": None,
+        "allow_overflow": False,
+        "requested_deadline_extension_days": None
+    }
+    # top-level aliases
+    aliases = {
+        "planned_effort_hours": ["planned_effort_hours", "planned_effort", "planned_hours", "planned_effort_h"],
+        "team_capacity_hours": ["team_capacity_hours", "capacity_hours", "team_capacity", "capacity_h"],
+        "delta_hours": ["delta_hours", "effort_delta_hours", "delta_h"],
+        "allow_overflow": ["allow_overflow", "overflow_allowed", "permit_overflow"],
+        "requested_deadline_extension_days": ["requested_deadline_extension_days", "deadline_extension_days", "extend_days"]
+    }
+    # normalize if reality_check nested dict exists
+    if isinstance(rc, dict):
+        for k, keys in aliases.items():
+            for key in keys:
+                if key in rc:
+                    out[k] = rc.get(key)
+                    break
+    # fallback to top-level fields
+    for k, keys in aliases.items():
+        if out[k] is None:
+            for key in keys:
+                if key in proposal:
+                    out[k] = proposal.get(key)
+                    break
+    # coerce types
+    def to_int(v):
+        try:
+            if v is None or v == "":
+                return None
+            return int(float(v))
+        except Exception:
+            return None
+    out["planned_effort_hours"] = to_int(out["planned_effort_hours"])
+    out["team_capacity_hours"] = to_int(out["team_capacity_hours"])
+    out["delta_hours"] = to_int(out["delta_hours"])
+    out["allow_overflow"] = bool(out["allow_overflow"])
+    out["requested_deadline_extension_days"] = to_int(out["requested_deadline_extension_days"])
+    return out
+
+def _enforce_capacity_on_phases(phases: list, capacity_hours: Optional[int], team_size: int,
+                                aggressive_pct: int = 30, min_phase_hours: int = 4):
+    """
+    Deterministically try to fit 'phases' into capacity_hours.
+    Strategy (order):
+      1) Try conservative compression of 'should' and 'optional' phases up to aggressive_pct each.
+      2) Drop 'optional' phases if needed (record dropped names).
+      3) Further compression on 'should' if still needed (second pass).
+      4) If still over and capacity_hours is not None, return overflow_hours > 0.
+    Returns: adjusted_phases, adjustments_info dict:
+       {"dropped_phases": [...], "compressions": [{"phase":..,"reduced":..}], "overflow_hours": int}
+    """
+    from math import floor, ceil
+
+    # Defensive copy
+    phases = [dict(p) for p in phases]
+    # ensure ints
+    for p in phases:
+        p["duration_hours"] = int(p.get("duration_hours") or 0)
+
+    total = sum(p["duration_hours"] for p in phases)
+    adjustments = {"dropped_phases": [], "compressions": [], "overflow_hours": 0}
+
+    if capacity_hours is None:
+        # nothing to enforce deterministically
+        adjustments["overflow_hours"] = max(0, total - (team_size * 8 * 20))  # heuristic
+        return phases, adjustments
+
+    if total <= capacity_hours:
+        adjustments["overflow_hours"] = 0
+        return phases, adjustments
+
+    # Priority ordering: optional -> should -> must (optional are first candidates to modify)
+    # First pass: compress should/optional by up to aggressive_pct
+    for p in phases:
+        if total <= capacity_hours:
+            break
+        if p.get("priority", "must") in ("should", "optional"):
+            original = p["duration_hours"]
+            max_reduction = int(floor(original * (aggressive_pct / 100.0)))
+            if max_reduction <= 0:
+                continue
+            needed = total - capacity_hours
+            reduction = min(max_reduction, needed)
+            if reduction > 0:
+                p["duration_hours"] = max(min_phase_hours, original - reduction)
+                actual_reduction = original - p["duration_hours"]
+                total -= actual_reduction
+                adjustments["compressions"].append({"phase": p["phase_name"], "reduced_hours": int(actual_reduction)})
+
+    # Second step: drop optional phases entirely (largest first)
+    if total > capacity_hours:
+        optional_phases = sorted([p for p in phases if p.get("priority", "must") == "optional"],
+                                 key=lambda x: x["duration_hours"], reverse=True)
+        for opt in optional_phases:
+            if total <= capacity_hours:
+                break
+            phases.remove(opt)
+            adjustments["dropped_phases"].append(opt["phase_name"])
+            total -= opt["duration_hours"]
+
+    # Third step: additional compression on 'should' phases (another aggressive_pct)
+    if total > capacity_hours:
+        should_phases = sorted([p for p in phases if p.get("priority", "must") == "should"],
+                               key=lambda x: x["duration_hours"], reverse=True)
+        for p in should_phases:
+            if total <= capacity_hours:
+                break
+            original = p["duration_hours"]
+            extra_reduction = int(floor(original * (aggressive_pct / 100.0)))
+            if extra_reduction <= 0:
+                continue
+            needed = total - capacity_hours
+            reduction = min(extra_reduction, needed)
+            p["duration_hours"] = max(min_phase_hours, original - reduction)
+            actual_reduction = original - p["duration_hours"]
+            total -= actual_reduction
+            adjustments["compressions"].append({"phase": p["phase_name"], "reduced_hours": int(actual_reduction)})
+
+    # Final overflow if still > capacity
+    adjustments["overflow_hours"] = max(0, total - capacity_hours)
+    return phases, adjustments
 
 def _build_suggestion_prompt(
     proposal: Dict[str, Any],
     tone: str = "Formal",
     max_deliverables: int = 8,
-    max_phases: int = 8,
+    max_phases: int = 20,   # расширённый верхний предел — LLM сама выбирает разумное число <= this
 ) -> str:
     """
-    Builds a prompt where all timelines are in hours (1 workday = 8h).
-    The returned JSON must use duration_hours and metadata.total_hours_realistic.
+    Builds a prompt for the suggestion endpoint with "Smart Fit" logic.
+    Uses JSON.dumps to safely embed the required output schema to avoid
+    Python f-string format specifier errors.
 
-    New behavior:
-    - If proposal contains "allow_overflow": true, the model may propose a plan that
-      exceeds computed capacity. In that case it MUST set metadata.allow_overflow_requested = true
-      and metadata.allow_overflow_used = true and provide overflow_plan/overflow_hours explaining
-      the extra hours and trade-offs.
-    - If allow_overflow is not requested, the model MAY still propose an overflow plan only as
-      a last resort, but must first return the honest baseline and set deadline_feasible=false,
-      and then place any overflow suggestion separately under metadata.overflow_plan (not mixed with
-      suggested_phases). This makes overflow explicit for downstream decision.
+    Key changes:
+    - LLM chooses number of phases based on project complexity and deadline,
+      constrained to 1..max_phases (default 20).
+    - Deadline feasibility check MUST be conservative and MUST NOT assume
+      parallel execution: compute calendar_days = ceil(SUM(duration_hours) / 8)
+      (i.e., single-stream execution, 8h/day). Compare calendar_days to days_until_deadline.
+    - All other adaptation rules (compression, dropping optional phases, etc.)
+      remain in force.
     """
+    import json
     import math
+    from datetime import date, datetime
 
-    deadline_str = proposal.get("deadline", "")
-    team_size = int(proposal.get("team_size", 1) or 1)
-    allow_overflow_requested = bool(proposal.get("allow_overflow", False))
+    rc = _extract_reality_check(proposal)
+    allow_overflow_requested = rc.get("allow_overflow", False)
 
-    total_team_capacity_hours = "null"
-    used_minimum = False
+    # team size (coerce safe)
+    try:
+        team_size = int(proposal.get("team_size", 1) or 1)
+    except Exception:
+        team_size = 1
 
-    if deadline_str:
+    # Capacity resolution (prefer reality check)
+    capacity_int = None
+    if rc.get("team_capacity_hours") is not None:
         try:
-            deadline_raw = proposal.get("deadline", "")
-            if isinstance(deadline_raw, date):
-                deadline_str = deadline_raw.strftime("%Y-%m-%d")
-            else:
-                deadline_str = str(deadline_raw)
-            deadline_date = datetime.strptime(deadline_str, "%Y-%m-%d").date()
-            today = date.today()
-
-            if deadline_date > today:
-                time_delta = deadline_date - today
-                # working days (5/7)
-                work_days = max(0, math.floor(time_delta.days * (5/7)))
-                available_hours_single_dev = work_days * 8
-
-                total_capacity = available_hours_single_dev * team_size
-
-                # minimum rule (if some time exists, ensure at least 8 hours)
-                if total_capacity < 8 and work_days > 0:
-                    used_minimum = True
-                    total_capacity = 8
-                elif work_days == 0:
-                    total_capacity = 0
-
-                total_team_capacity_hours = str(int(total_capacity)) if total_capacity is not None else "0"
-            else:
-                total_team_capacity_hours = "0"
+            capacity_int = int(rc["team_capacity_hours"])
         except Exception:
-            total_team_capacity_hours = "null"
+            capacity_int = None
     else:
-        total_team_capacity_hours = "null"
+        # compute from deadline if provided (used as fallback capacity estimate only)
+        capacity_int = None
+        deadline_raw = proposal.get("deadline") or proposal.get("deadline_date")
+        if deadline_raw:
+            try:
+                if isinstance(deadline_raw, (date, datetime)):
+                    d_obj = deadline_raw if isinstance(deadline_raw, date) else deadline_raw.date()
+                else:
+                    # be permissive parsing ISO-like strings
+                    d_obj = datetime.fromisoformat(str(deadline_raw)).date()
+                today = date.today()
+                if d_obj > today:
+                    days_diff = (d_obj - today).days
+                    work_days = max(0, math.floor(days_diff * (5.0 / 7.0)))
+                    capacity_int = int(max(0, work_days * 8 * team_size))
+                else:
+                    capacity_int = 0
+            except Exception:
+                capacity_int = None
 
-    client = proposal.get("client_company_name") or proposal.get("client_name") or ""
+    total_team_capacity_hours = capacity_int if capacity_int is not None else "null"
+    # target budget (safety buffer)
+    target_budget_hours = int(capacity_int * 0.95) if isinstance(capacity_int, int) and capacity_int > 0 else ("null" if capacity_int is None else int(capacity_int))
+
+    client = proposal.get("client_company_name") or proposal.get("client_name") or "Client"
     project_goal = proposal.get("project_goal", "") or proposal.get("goal", "")
     scope = proposal.get("scope", "") or proposal.get("description", "")
     technologies = proposal.get("technologies") or proposal.get("tech") or []
     techs = ", ".join(technologies) if isinstance(technologies, (list, tuple)) else str(technologies)
 
-    # Build instruction: require explicit dropped_phases and overflow metadata
-    prompt = f"""
-You are an experienced IT/AI project manager and proposal architect. Produce a concise,
-professional plan (deliverables + phased timeline) that fits the available schedule.
+    # canonical JSON schema (assistant must return exactly this structure)
+    schema = {
+      "suggested_phases": [
+        {
+          "phase_name": "string",
+          "duration_hours": 0,
+          "original_hours": None,
+          "tasks": "string",
+          "owner": "string",
+          "priority": "must|should|optional",
+          "compression_pct": None
+        }
+      ],
+      "suggested_deliverables": [
+        { "title": "string", "description": "string", "acceptance_criteria": "string" }
+      ],
+      "risks_text": "string (phase-level bullets first if any flagged, then system-level risks)",
+      "assumptions_text": "string (one assumption per line, newline escaped '\\n')",
+      "metadata": {
+        "total_hours_realistic": 0,
+        "capacity_hours_available": None,
+        "deadline_feasible": False,
+        "risk_message": "",
+        "dropped_phases": [],
+        "allow_overflow_requested": bool(allow_overflow_requested),
+        "allow_overflow_used": False,
+        "overflow_hours": 0,
+        "overflow_plan": None,
+        "primary_recommendation": None,
+        "primary_recommendation_rationale": ""
+      }
+    }
 
-IMPORTANT: You MUST return exactly one valid JSON object and NOTHING ELSE — no explanations,
-no markdown, no commentary.
+    # Prepare days until deadline (nullable)
+    days_until_deadline = None
+    deadline_raw = proposal.get("deadline") or proposal.get("deadline_date")
+    try:
+        if deadline_raw:
+            if isinstance(deadline_raw, (date, datetime)):
+                d_obj = deadline_raw if isinstance(deadline_raw, date) else deadline_raw.date()
+            else:
+                d_obj = datetime.fromisoformat(str(deadline_raw)).date()
+            today = date.today()
+            days_until_deadline = max(0, (d_obj - today).days)
+    except Exception:
+        days_until_deadline = None
 
-INPUT DATA:
-- Client: "{client}"
-- Goal: "{project_goal}"
-- Scope: "{scope}"
-- Tech Stack: "{techs}"
-- Hard Deadline Provided: "{deadline_str}"
-- Team Size: {team_size} people
-- MAX TEAM CAPACITY (HOURS): {total_team_capacity_hours}
+    # Build the prompt body (variables inserted safely)
+    header = (
+        "You are a Senior Project Manager and Solution Architect.\n"
+        "Produce a single JSON object exactly matching the provided OUTPUT_SCHEMA (no markdown, no extra text).\n\n"
+        "KEY REQUIREMENTS:\n"
+        "- ALL phase durations MUST be TOTAL MAN-HOURS (integer) in field `duration_hours`.\n"
+        "- Return a sensible number of phases chosen by you (the LLM) based on the project's scope, complexity and the deadline.\n"
+        "- The assistant MAY return between 1 and " + str(max_phases) + " phases. Choose the number that best balances clarity and feasibility.\n"
+        "- Provide `original_hours` when you compress a phase and `compression_pct` where applicable.\n"
+        "- metadata.total_hours_realistic MUST equal the integer SUM of all suggested_phases.duration_hours.\n"
+        "- **Deadline check (CONSERVATIVE / MANDATORY):** When deciding feasibility against a provided deadline, do NOT assume parallel execution across team members.\n"
+        "  Compute calendar_days_required = ceil( SUM(duration_hours) / 8 ). Compare calendar_days_required to the days available until the deadline (days_until_deadline).\n"
+        "  If days_until_deadline is provided and calendar_days_required <= days_until_deadline then metadata.deadline_feasible = true. Otherwise metadata.deadline_feasible = false and run the ADAPTATION ALGORITHM.\n"
+        "- If capacity is known and allow_overflow is false, do NOT return total_hours_realistic > capacity (apply compression/dropping rules if needed).\n"
+        "- If compressing/dropping, document every change in metadata.dropped_phases, metadata.risk_message and assumptions_text.\n"
+        "- Provide structured phase-level risks in metadata.phase_risks if any phase is flagged (duration too short, compressed > allowed, external dependency risk).\n\n"
+    )
 
-ADDITIONAL INPUT FLAG:
-- allow_overflow (boolean): {str(allow_overflow_requested).lower()}
+    # context summary (safe insert)
+    context = {
+        "client": client,
+        "goal": project_goal,
+        "scope": scope,
+        "tech_stack": techs,
+        "team_size": team_size,
+        "capacity_hours_available": total_team_capacity_hours,
+        "target_budget_hours": target_budget_hours,
+        "allow_overflow_requested": bool(allow_overflow_requested),
+        "deadline_days_available": days_until_deadline if days_until_deadline is not None else "null",
+        "deadline": proposal.get("deadline") or proposal.get("deadline_date") or ""
+    }
 
-OUTPUT SCHEMA (JSON only):
-{{
-  "suggested_deliverables": [ {{ "title": "...", "description": "...", "acceptance": "..." }} ],
-  "suggested_phases": [
-    {{
-      "phase_name": "...",
-      "duration_hours": <INTEGER, realistic estimate regardless of deadline>,
-      "tasks": "...",
-      "owner": "...",
-      "priority": "<must|should|optional>"
-    }}
-  ],
-  "metadata": {{
-    "total_hours_realistic": <INTEGER, sum of phases>,
-    "capacity_hours_available": <INTEGER or null if unknown>,
-    "deadline_feasible": <BOOLEAN>,
-    "risk_message": "<String: warning message if not feasible, else empty>",
-    "used_minimum_deadline": <BOOLEAN>,
-    "dropped_phases": [ "<phase_name>", ... ],
-    "allow_overflow_requested": {str(allow_overflow_requested).lower()},
-    "allow_overflow_used": <BOOLEAN>,            // true if the returned primary plan exceeds capacity
-    "overflow_hours": <INTEGER>,                // number of hours beyond capacity (0 if none)
-    "overflow_plan": "<STRING or short object explaining the overflow plan and trade-offs>" 
-  }}
-}}
+    # instruction block with schema injected via json.dumps to avoid braces issues
+    prompt_parts = [
+        header,
+        "INPUT SUMMARY:\n" + json.dumps(context, ensure_ascii=False, indent=2) + "\n\n",
+        "OUTPUT_SCHEMA (return EXACTLY one JSON object following this schema):\n",
+        json.dumps(schema, ensure_ascii=False, indent=2),
+        "\n\nADAPTATION ALGORITHM (MANDATORY - execute in this order):\n"
+        "1) Compute honest baseline (original_hours per phase) and SUM total_hours_realistic.\n"
+        "2) Perform the CONSERVATIVE deadline check (do NOT assume parallelism):\n"
+        "     calendar_days_required = ceil(total_hours_realistic / 8)\n"
+        "     Compare calendar_days_required to deadline_days_available (from INPUT SUMMARY).\n"
+        "     If calendar_days_required <= deadline_days_available -> set metadata.deadline_feasible = true and return realistic plan.\n"
+        "3) If baseline > capacity -> apply in order:\n"
+        "   A) Re-sequence where logically possible (this does NOT change SUM of man-hours and is NOT to be used to claim deadline feasibility — deadline check remains conservative single-stream).\n"
+        "   B) Compress 'should'/'optional' phases up to aggressive_compression_limit_pct each (document per-phase compression)\n"
+        "   C) Drop 'optional' phases (list in metadata.dropped_phases)\n"
+        "   D) If still > capacity or deadline infeasible:\n"
+        "        - If allow_overflow true: set allow_overflow_used=true and provide overflow_plan and overflow_hours\n"
+        "        - Else: set deadline_feasible=false and pick one primary_recommendation with numeric rationale (extend_deadline | add_fte | compress_scope | accept_risk_with_mitigation)\n\n"
+        "PHASE RISK RULES (MANDATORY):\n"
+        "- too_short_threshold_h = 8\n"
+        "- preferred_must_phase_h = 24\n"
+        "- aggressive_compression_limit_pct = 30\n"
+        "- If any phase triggers a 'too short' or 'compression > allowed' condition, the assistant MUST:\n"
+        "  1) add a detailed object to metadata.phase_risks (array of structured risk objects),\n"
+        "  2) add a short bullet (one line) describing the same phase-level risk UNDER the appropriate severity in risks_text BEFORE system-level risks.\n"
+        "- If no phase is flagged, omit metadata.phase_risks entirely and do not include phase-level bullets in risks_text.\n"
+        "\n"
+        "ADDITIONAL GUIDANCE:\n"
+        "- Choose phase granularity appropriate to the project: fewer phases (big buckets) for short/urgent engagements, more phases (detailed workstreams) for long/complex programs.\n"
+        "- Do NOT invent client-specific facts; only use the INPUT SUMMARY and reasonable assumptions — list all assumptions in assumptions_text (one per line).\n"
+        "- Use '\\n' for paragraph breaks in narrative fields. All numbers as integers where specified.\n"
+    ]
 
-CRITICAL RULES (order of operations):
-1) Compute an HONEST baseline estimate: realistic hours for the full scope -> set metadata.total_hours_realistic.
-2) Compare baseline vs capacity (metadata.capacity_hours_available = {total_team_capacity_hours}).
-3) If baseline <= capacity:
-    - Return the plan in suggested_phases, set deadline_feasible = true, dropped_phases = [], allow_overflow_used = false, overflow_hours = 0.
-4) If baseline > capacity:
-    A) FIRST: attempt to fit by REMOVING optional phases (priority == "optional"). Move removed names to metadata.dropped_phases.
-    B) SECOND: if still over capacity, compress "should" phases to realistic minimums (>=4h) where possible.
-    C) If after A+B the plan fits capacity:
-         - Return the reduced plan in suggested_phases, set deadline_feasible = true, allow_overflow_used = false, overflow_hours = 0,
-         - risk_message must list dropped phases and brief trade-offs.
-    D) If after removing/compressing the plan STILL EXCEEDS capacity:
-         - If allow_overflow was explicitly requested (allow_overflow=true in INPUT), you MAY return a plan that exceeds capacity:
-             * set allow_overflow_used = true,
-             * set overflow_hours = total_hours_realistic - capacity_hours_available (integer),
-             * include overflow_plan explaining required extra hours, why they are necessary, what will be deprioritized if overflow is not accepted,
-             * set deadline_feasible = true (because the plan is deliverable if extra hours/resources are accepted), and
-             * set risk_message describing trade-offs and recommendation ("Accept overflow X hours or extend deadline or reduce scope A,B").
-         - ELSE (no allow_overflow request): YOU MUST NOT silently return an overflow plan as the main suggested_phases.
-             * Instead set deadline_feasible = false,
-             * return the honest baseline in suggested_phases,
-             * set allow_overflow_used = false,
-             * set overflow_hours = metadata.total_hours_realistic - capacity_hours_available,
-             * set metadata.overflow_plan to a separate suggested overflow plan (clear text/object),
-             * risk_message MUST include exact mismatch like: "Baseline requires {{" + "total_hours_realistic" + "}}h but only {total_team_capacity_hours}h available."
-5) Phase durations must be integers >= 4 hours. Sum of durations must equal metadata.total_hours_realistic.
-6) If you removed phases to fit capacity, ensure removed phases are NOT present in suggested_phases and ARE listed in metadata.dropped_phases.
-7) Always fill metadata.used_minimum_deadline true/false if you applied the minimum 8-hour rule.
+    prompt = "\n".join(prompt_parts)
+    return prompt
 
-VALIDATION BEFORE RETURN:
-- Ensure numeric fields are integers.
-- Ensure len(suggested_phases) <= {max_phases} and len(suggested_deliverables) <= {max_deliverables}.
-- Ensure metadata.total_hours_realistic equals sum(suggested_phases.duration_hours).
-- Ensure metadata contains dropped_phases, overflow_plan, overflow_hours, allow_overflow_used, allow_overflow_requested.
 
-Return only the single JSON object — absolutely no extra text.
-"""
-    return prompt.strip()
 
+
+import os
+from docx import Document
+
+def extract_request_from_proposal(proposal_file_path: str, output_file_path: str) -> str:
+    """
+    Извлекает текст миссии и резюме из документа Proposal, 
+    которые максимально точно отражают исходный Запрос (Request) клиента.
+    """
+    try:
+        # 1. Загрузка документа
+        document = Document(proposal_file_path)
+        
+        # 2. Инициализация переменных для хранения извлеченного текста
+        executive_summary = ""
+        project_mission = ""
+        
+        # 3. Флаги для определения, в каком разделе мы находимся
+        in_summary = False
+        in_mission = False
+
+        # 4. Поиск и извлечение текста
+        for paragraph in document.paragraphs:
+            text = paragraph.text.strip()
+            
+            if "1. Executive Summary" in text or "1. Резюме" in text:
+                in_summary = True
+                in_mission = False
+                continue
+            
+            if "2. Product Overview & Mission" in text or "2. Обзор продукта и миссия" in text:
+                in_summary = False
+                in_mission = True
+                continue
+            
+            # Останавливаем извлечение, как только дойдем до следующего раздела (3. Technical...)
+            if text.startswith("3. Technical Implementation Proposal") or text.startswith("3. Техническое Предложение"):
+                break
+                
+            if in_summary and text and text != "Innovative Solutions LLC":
+                # Добавляем текст, пропуская пустые строки и дублирование заголовка
+                executive_summary += text + "\n"
+            
+            if in_mission and text and text != "Innovative Solutions LLC":
+                # Добавляем текст, пропуская пустые строки и дублирование заголовка
+                project_mission += text + "\n"
+
+        # 5. Формирование итогового текста запроса
+        request_text = (
+            f"=== ИСХОДНЫЙ ЗАПРОС КЛИЕНТА (РЕКОНСТРУКЦИЯ) ===\n\n"
+            f"--- 1. РЕЗЮМЕ ЗАДАЧИ (Executive Summary) ---\n"
+            f"{executive_summary.strip()}\n\n"
+            f"--- 2. МИССИЯ ПРОЕКТА (Project Mission) ---\n"
+            f"{project_mission.strip()}"
+        )
+
+        # 6. Сохранение в отдельный файл
+        with open(output_file_path, 'w', encoding='utf-8') as f:
+            f.write(request_text)
+            
+        return f"Исходный запрос успешно извлечен и сохранен в файл: {os.path.abspath(output_file_path)}"
+
+    except FileNotFoundError:
+        return f"Ошибка: Файл {proposal_file_path} не найден."
+    except Exception as e:
+        return f"Произошла ошибка при обработке документа: {e}"
+
+# --- ЗАПУСК ---
+proposal_filename = "Proposal_Innovative Solutions LLC(10).docx"
+output_filename = "Extracted_Client_Request.txt"
+
+# Убедитесь, что файл {proposal_filename} находится в той же директории, что и скрипт
+result_message = extract_request_from_proposal(proposal_filename, output_filename)
+print(result_message)
